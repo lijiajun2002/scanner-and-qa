@@ -1,0 +1,18 @@
+# 视觉 LLM 服务（OpenAI 兼容）。API Key 放在 .env 的 OPENAI_API_KEY 里。
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+max_tokens = 1024
+
+# 固定提示词：每次拍照后都会附上这句发给模型
+prompt = "这张照片里有什么要素？"
+
+# 摄像头设备序号：/dev/video0 对应 0，/dev/video1 对应 1
+camera_index = 0
+
+# 触发拍照的鼠标键：left / right / middle / x1 / x2
+# 不确定是哪个就用 `python main.py --detect` 探测
+mouse_button = "x2"
+
+# 拍照后是否把照片留档
+save_photos = true
+output_dir = "~/Pictures/scanner-and-qa"

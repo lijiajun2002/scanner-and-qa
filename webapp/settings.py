@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+DEFAULTS: dict = {
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key": "",
+    "prompt": "这张照片里有什么要素？",
+    "max_tokens": 1024,
+    "b_api_token": "",
+}
+
+
+def _settings_path(path: Path | str | None = None) -> Path:
+    if path is not None:
+        return Path(path)
+    return Path(os.environ.get("WEBAPP_SETTINGS", "./webapp_settings.json"))
+
+
+def load_settings(path: Path | str | None = None) -> dict:
+    target = _settings_path(path)
+    data = dict(DEFAULTS)
+    if target.exists():
+        try:
+            data.update(json.loads(target.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # 环境变量优先，方便在容器里用 secret 注入而不落盘
+    if os.environ.get("OPENAI_API_KEY"):
+        data["api_key"] = os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_BASE_URL"):
+        data["base_url"] = os.environ["OPENAI_BASE_URL"]
+    if os.environ.get("B_API_TOKEN"):
+        data["b_api_token"] = os.environ["B_API_TOKEN"]
+    return data
+
+
+def save_settings(data: dict, path: Path | str | None = None) -> None:
+    target = _settings_path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

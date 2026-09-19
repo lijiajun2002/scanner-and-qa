@@ -1,0 +1,39 @@
+name: build-b-client-windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'b_client/**'
+      - '.github/workflows/build-b-client.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r b_client/requirements.txt pyinstaller
+
+      - name: Build exe
+        working-directory: b_client
+        run: pyinstaller --noconfirm --clean capture_agent.spec
+
+      - name: Add default config
+        run: Copy-Item b_client/config.example.json b_client/dist/config.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScannerQA-Agent-windows
+          path: |
+            b_client/dist/ScannerQA-Agent.exe
+            b_client/dist/config.json
+          if-no-files-found: error

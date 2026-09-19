@@ -1,0 +1,15 @@
+services:
+  scanner-qa:
+    build: .
+    image: scanner-and-qa:latest
+    container_name: scanner-and-qa
+    ports:
+      - "8502:8501"
+      - "8503:8503"
+    volumes:
+      - ./data:/data
+    environment:
+      # 可选：优先用环境变量注入，避免把 key 写进 data/settings.json
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - B_API_TOKEN=${B_API_TOKEN:-}
+    restart: unless-stopped
