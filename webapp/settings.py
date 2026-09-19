@@ -11,6 +11,7 @@ DEFAULTS: dict = {
     "prompt": "这张照片里有什么要素？",
     "max_tokens": 1024,
     "b_api_token": "",
+    "extract_prompt": "上述所有图片都是同一个题目的截图，请把它们的内容整理成规范、完整、可直接作答的题干。",
 }
 
 

@@ -4,6 +4,7 @@
 无窗口常驻：长轮询 S 的 /pending 领取任务并执行：
   - capture：静默抓主屏 → POST /frame
   - type   ：把文本逐字注入当前焦点窗口 → POST /result
+同时注册全局热键（Ctrl+Shift+Alt+8 截屏 / +9 分析 / +0 输入回答 / +- 清空对话 / ++ 停止输入）。
 
 中文/Unicode 用 SendInput + KEYEVENTF_UNICODE 逐字注入，不占用剪贴板、不受输入法/键盘布局影响。
 打字任务可选：
@@ -37,6 +38,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -60,10 +62,12 @@ _MSS = getattr(mss, "MSS", None) or mss.mss
 DEFAULTS = {
     "server_url": "http://127.0.0.1:8503",
     "token": "",
-    "monitor": 1,          # 1 = 主屏（0 是所有屏拼合的虚拟屏）
+    "monitor": 1,          # 1 = 主屏（0 = 所有屏拼合的虚拟屏）
     "jpeg_quality": 85,
     "scale": 1.0,
     "poll_wait": 25,
+    # 全局热键总开关：Ctrl+Shift+Alt+8/9/0/-/+（Windows 虚拟键码判定）
+    "hotkeys_enabled": True,
 }
 
 
@@ -177,10 +181,10 @@ if os.name == "nt":
 
 # 输入行为的默认参数（可在 config.json 覆盖）
 TYPING_DEFAULTS = {
-    "interval_min_ms": 50,       # 字符间隔下限
-    "interval_max_ms": 120,      # 字符间隔上限
-    "line_pause_min_ms": 300,    # 换行后停顿下限
-    "line_pause_max_ms": 1000,   # 换行后停顿上限
+    "interval_min_ms": 200,      # 字符间隔下限
+    "interval_max_ms": 1000,     # 字符间隔上限
+    "line_pause_min_ms": 1000,   # 换行后停顿下限
+    "line_pause_max_ms": 2000,   # 换行后停顿上限
     "typo_rate": 0.005,          # 每字符出错概率
     "typo_pause_min_ms": 100,    # 错字后停顿下限
     "typo_pause_max_ms": 300,    # 错字后停顿上限
@@ -198,6 +202,14 @@ class SendInputTyper:
         if options:
             self.options.update({k: options[k] for k in TYPING_DEFAULTS if k in options})
         self.skipped = 0
+        self.typed = 0
+        self.stopped = False
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        """请求停止当前输入（供停止热键调用）。"""
+        self._stop.set()
+        self.stopped = True
 
     @staticmethod
     def _sendable_unicode(ch: str) -> bool:
@@ -238,21 +250,32 @@ class SendInputTyper:
             time.sleep(start_delay_s)
 
         self.skipped = 0
+        self.typed = 0
+        self.stopped = False
+        self._stop.clear()
         if paste_mode:
+            if self._stop.is_set():
+                self.stopped = True
+                return 0
             _set_clipboard_text(text)
             time.sleep(0.05)
             _paste_shortcut()
+            self.typed = len(text)
             return 0
 
         dismiss = self.options["dismiss_suggest"] if dismiss_suggest is None else dismiss_suggest
 
         for ch in text:
+            if self._stop.is_set():
+                self.stopped = True
+                break
             if unicode_only and not self._sendable_unicode(ch):
                 self.skipped += 1
                 continue
 
             if ch in ("\n", "\r"):
                 self._tap(_VK_RETURN, dismiss)
+                self.typed += 1
                 if humanize:
                     time.sleep(random.uniform(self.options["line_pause_min_ms"],
                                               self.options["line_pause_max_ms"]) / 1000.0)
@@ -262,6 +285,7 @@ class SendInputTyper:
 
             if ch == "\t":
                 self._tap(_VK_TAB, dismiss)
+                self.typed += 1
                 self._normal_interval(humanize, int(interval_ms))
                 continue
 
@@ -273,6 +297,7 @@ class SendInputTyper:
                 _send_inputs(_vk_input(_VK_BACK, False), _vk_input(_VK_BACK, True))
 
             self._unicode_char(ch)
+            self.typed += 1
             self._normal_interval(humanize, int(interval_ms))
         return self.skipped
 
@@ -353,6 +378,113 @@ def post_result(base: str, headers: dict, log: logging.Logger,
         log.warning("上报结果失败: %s", exc)
 
 
+def post_action(base: str, headers: dict, log: logging.Logger, action: str,
+                payload: dict | None = None) -> None:
+    body = {"action": action}
+    if payload:
+        body.update(payload)
+    try:
+        requests.post(f"{base}/action", json=body, headers=headers, timeout=10)
+        log.info("已投递热键动作: %s", body)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("投递热键动作失败: %s", exc)
+
+
+# ============================ 全局热键 ============================
+# Ctrl+Shift+Alt + 主键盘 8/9/0/-/=（+）；Windows 用虚拟键码判定，避免 Shift 改写字符。
+_VK_ACTION = {
+    0x38: "capture",       # 8
+    0x39: "analyze",       # 9
+    0x30: "type_answer",   # 0
+    0xBD: "clear",         # 主键盘 -
+    0xBB: "stop_type",     # 主键盘 = / +
+    0x6D: "clear",         # 小键盘 -
+    0x6B: "stop_type",     # 小键盘 +
+}
+_CHAR_ACTION = {
+    "8": "capture", "9": "analyze", "0": "type_answer",
+    "-": "clear", "=": "stop_type", "+": "stop_type",
+}
+_MOD_CTRL = {"ctrl", "ctrl_l", "ctrl_r"}
+_MOD_SHIFT = {"shift", "shift_l", "shift_r"}
+_MOD_ALT = {"alt", "alt_l", "alt_r", "alt_gr"}
+
+
+class GlobalHotkeys:
+    """Ctrl+Shift+Alt+8/9/0/-/+ 全局热键：另外三键投递动作给 S，+ 键本地停止输入。"""
+
+    def __init__(self, base: str, headers: dict, log: logging.Logger,
+                 typer: "SendInputTyper | None") -> None:
+        self.base = base
+        self.headers = headers
+        self.log = log
+        self.typer = typer
+        self.ctrl = self.shift = self.alt = False
+        self.listener = None
+
+    def _action_for(self, key) -> str | None:
+        vk = getattr(key, "vk", None)
+        if vk in _VK_ACTION:
+            return _VK_ACTION[vk]
+        return _CHAR_ACTION.get(getattr(key, "char", None))
+
+    def _on_press(self, key) -> None:
+        name = getattr(key, "name", None)
+        if name in _MOD_CTRL:
+            self.ctrl = True
+            return
+        if name in _MOD_SHIFT:
+            self.shift = True
+            return
+        if name in _MOD_ALT:
+            self.alt = True
+            return
+        if not (self.ctrl and self.shift and self.alt):
+            return
+        action = self._action_for(key)
+        if action:
+            self._trigger(action)
+
+    def _on_release(self, key) -> None:
+        name = getattr(key, "name", None)
+        if name in _MOD_CTRL:
+            self.ctrl = False
+        elif name in _MOD_SHIFT:
+            self.shift = False
+        elif name in _MOD_ALT:
+            self.alt = False
+
+    def _trigger(self, action: str) -> None:
+        if action == "stop_type":
+            if self.typer is not None:
+                self.typer.stop()
+                self.log.info("停止热键：已请求停止当前键盘输出")
+            return
+        payload = {"extract": True} if action == "analyze" else None
+        post_action(self.base, self.headers, self.log, action, payload)
+
+    def start(self):
+        try:
+            from pynput import keyboard
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("pynput 不可用，全局热键关闭: %s", exc)
+            return None
+        try:
+            self.listener = keyboard.Listener(
+                on_press=self._on_press, on_release=self._on_release)
+            self.listener.daemon = True
+            self.listener.start()
+            self.log.info("全局热键已启用: Ctrl+Shift+Alt+8/9/0/-/+")
+            return self.listener
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("启动全局热键失败: %s", exc)
+            return None
+
+
+def start_hotkeys(base: str, headers: dict, log: logging.Logger, typer):
+    return GlobalHotkeys(base, headers, log, typer).start()
+
+
 def main() -> int:
     cfg = load_config()
     try:
@@ -367,6 +499,8 @@ def main() -> int:
     poll_timeout = int(cfg["poll_wait"]) + 10
     typer = SendInputTyper(cfg)
     log.info("启动: S=%s monitor=%s", base, cfg["monitor"])
+    if cfg.get("hotkeys_enabled", True):
+        start_hotkeys(base, headers, log, typer)
 
     backoff = 1
     with _MSS() as sct:
@@ -403,9 +537,11 @@ def main() -> int:
                             bool(job.get("dismiss_suggest", True)),
                             bool(job.get("paste_mode", False)),
                         )
-                        log.info("已逐字输入 %d 字（跳过 %d）", len(text) - skipped, skipped)
+                        note = "（已被停止热键中断）" if typer.stopped else ""
+                        log.info("已逐字输入 %d 字（跳过 %d）%s", typer.typed, skipped, note)
                         post_result(base, headers, log, "type", True,
-                                    chars=len(text) - skipped, skipped=skipped)
+                                    chars=typer.typed, skipped=skipped,
+                                    error="stopped" if typer.stopped else None)
                     except Exception as exc:  # noqa: BLE001
                         log.warning("输入失败: %s", exc)
                         post_result(base, headers, log, "type", False, error=str(exc))
