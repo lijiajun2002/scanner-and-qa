@@ -23,21 +23,21 @@ $vpy  = Join-Path $venv 'Scripts\python.exe'
 if ($Force -or -not (Test-Path $vpy)) {
     $uv = Find-Uv
     if (-not $uv) {
-        Write-Host "[x] 未找到 uv，无法创建环境。先运行 build_exe.ps1。" -ForegroundColor Red
+        Write-Host "[x] uv not found. Run build_exe.ps1 first to create the environment." -ForegroundColor Red
         try { Stop-Transcript | Out-Null } catch { }
         exit 1
     }
-    Write-Host "[i] 创建虚拟环境（首次或 -Force）"
+    Write-Host "[i] creating virtualenv (first run or -Force)"
     if (Test-Path $venv) { Remove-Item -Recurse -Force $venv }
     & $uv venv $venv
     & $uv pip install --python $vpy -r requirements.txt pyinstaller
 } else {
-    Write-Host "[i] 复用已有 .build-venv（要重建请用 -Force）"
+    Write-Host "[i] reusing existing .build-venv (use -Force to recreate)"
     $uv = Find-Uv
     if ($uv) { & $uv pip install -q --python $vpy -r requirements.txt pyinstaller }
 }
 
-Write-Host "=== 增量打包（不加 --clean，复用 build 缓存）==="
+Write-Host "=== incremental build (no --clean, reuse build cache) ==="
 & $vpy -m PyInstaller --noconfirm capture_agent.spec
 $rc = $LASTEXITCODE
 
@@ -47,8 +47,8 @@ if (-not (Test-Path $cfg)) { Copy-Item (Join-Path $PSScriptRoot 'config.example.
 
 $exe = Join-Path $dist 'ScannerQA-Agent.exe'
 if ($rc -eq 0 -and (Test-Path $exe)) {
-    Write-Host "[ok] 已更新: $exe" -ForegroundColor Green
+    Write-Host "[ok] updated: $exe" -ForegroundColor Green
 } else {
-    Write-Host "[x] 打包失败（code $rc），见 $log" -ForegroundColor Red
+    Write-Host "[x] build failed (code $rc), see $log" -ForegroundColor Red
 }
 try { Stop-Transcript | Out-Null } catch { }

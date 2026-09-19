@@ -8,9 +8,9 @@
 
 中文/Unicode 用 SendInput + KEYEVENTF_UNICODE 逐字注入，不占用剪贴板、不受输入法/键盘布局影响。
 代码缩进策略（indent_mode）：
-  - vscode：预测 VS Code + Python 的自动缩进，仅补差量（默认）
-  - target：兜底，无视自动缩进，用 Home×2 + Shift+End 选中后重打目标缩进
-  - none  ：原样逐字
+  - human：逐行对齐（回车后选中当前行空白 → 按目标缩进替换 → 逐字输入正文），默认
+  - none ：原样逐字，不做缩进对齐
+另支持 paste_mode：整段剪贴板粘贴（最保真，会覆盖剪贴板）。
 其它参数：indent_style(spaces/tabs)、tab_size、space_interval_ms(空格/缩进专用高速间隔)、
   clean_invisibles、dismiss_suggest/dismiss_delay_ms、humanize/typo_* 等，均可由 S 端网页下发。
 全局热键组合由 S 端 /hotkeys 下发（默认 ctrl+shift+alt+8/9/0/minus/plus）。
@@ -125,8 +125,6 @@ if os.name == "nt":
     _VK_SHIFT = 0x10
     _VK_HOME = 0x24
     _VK_END = 0x23
-    _VK_L = 0x4C
-    _VK_C = 0x43
     _CF_UNICODETEXT = 13
     _GMEM_MOVEABLE = 0x0002
 
@@ -186,27 +184,6 @@ if os.name == "nt":
             _vk_input(_VK_CONTROL, True),
         )
 
-    _user32.GetClipboardData.argtypes = [wintypes.UINT]
-    _user32.GetClipboardData.restype = wintypes.HANDLE
-
-    def _get_clipboard_text() -> str:
-        """读取剪贴板文本（用于测量 IDE 的实际缩进）。"""
-        if not _user32.OpenClipboard(None):
-            return ""
-        try:
-            handle = _user32.GetClipboardData(_CF_UNICODETEXT)
-            if not handle:
-                return ""
-            ptr = _kernel32.GlobalLock(handle)
-            if not ptr:
-                return ""
-            try:
-                return ctypes.c_wchar_p(ptr).value or ""
-            finally:
-                _kernel32.GlobalUnlock(handle)
-        finally:
-            _user32.CloseClipboard()
-
 
 # 输入行为的默认参数（可在 config.json 覆盖）
 TYPING_DEFAULTS = {
@@ -220,8 +197,8 @@ TYPING_DEFAULTS = {
     "typo_pause_max_ms": 300,    # 错字后停顿上限
     "dismiss_suggest": True,     # 回车/制表前先按 Esc 关掉 IDE 自动补全弹窗
     "dismiss_delay_ms": 80,      # Esc 与特殊键之间的等待
-    "enter_via_paste": False,    # 换行用剪贴板粘贴插入（non-code 模式可用）
-    "indent_mode": "vscode",     # vscode / target / none
+    "enter_via_paste": False,    # 换行用剪贴板粘贴插入（仅 indent_mode=none 时生效）
+    "indent_mode": "human",      # human / none
     "indent_style": "spaces",    # spaces / tabs
     "tab_size": 4,
     "clean_invisibles": True,    # 清理 NBSP/全角空格/零宽/智能引号
@@ -275,41 +252,6 @@ def build_indent(cols: int, style: str, tab_size: int) -> str:
     return " " * cols
 
 
-def bracket_delta(body: str) -> int:
-    """计算一行括号净变化，忽略字符串与 # 注释。"""
-    depth = 0
-    quote = None
-    i = 0
-    while i < len(body):
-        c = body[i]
-        if quote:
-            if c == "\\":
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c in "\"'":
-            quote = c
-        elif c == "#":
-            break
-        elif c in "([{":
-            depth += 1
-        elif c in ")]}":
-            depth -= 1
-        i += 1
-    return depth
-
-
-def predict_indent(prev_body: str, prev_cols: int, bracket_depth: int,
-                   bracket_base: int, tab_size: int) -> int:
-    """预测 VS Code + Python 回车后自动缩进到的列数。"""
-    if bracket_depth > 0:
-        return bracket_base + tab_size
-    if prev_body.rstrip().endswith(":"):
-        return prev_cols + tab_size
-    return prev_cols
-
-
 class SendInputTyper:
     """用 Windows SendInput 逐字注入文本，可选拟人化节奏与纯 Unicode 过滤。"""
 
@@ -359,50 +301,24 @@ class SendInputTyper:
     def _space_interval(self) -> None:
         time.sleep(self.options["space_interval_ms"] / 1000.0)
 
-    def _ctrl_key(self, vk: int) -> None:
-        _send_inputs(
-            _vk_input(_VK_CONTROL, False),
-            _vk_input(vk, False),
-            _vk_input(vk, True),
-            _vk_input(_VK_CONTROL, True),
-        )
+    def _select_line_content(self, dismiss: bool = False) -> None:
+        """选中当前行内容（保留选区，不含换行）。
 
-    def _select_line(self, dismiss: bool) -> None:
+        两次 Home 确保到绝对行首（应对 VS Code 的智能 Home / 自动缩进），
+        再 Shift+End 选中整行内容。此时该行只含自动缩进空白，随后直接输入
+        目标缩进即可替换选区；不依赖剪贴板，也不会删除换行或合并下一行。
+        """
         if dismiss:
             _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
             time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
-        self._ctrl_key(_VK_L)  # VS Code：选中当前整行
-
-    def _measure_indent(self, dismiss: bool) -> int | None:
-        """Ctrl+L 选中当前行 → Ctrl+C → 读剪贴板，返回实际缩进列数（失败返回 None）。"""
-        self._select_line(dismiss)
-        self._ctrl_key(_VK_C)
-        text = ""
-        for _ in range(6):
-            time.sleep(0.04)
-            text = _get_clipboard_text()
-            if text:
-                break
-        if "\n" in text or "\r" in text:
-            return None  # 选中包含换行，别用它替换
-        cols = 0
-        for ch in text:
-            if ch == "\t":
-                size = int(self.options["tab_size"])
-                cols += size - (cols % size)
-            elif ch == " ":
-                cols += 1
-            else:
-                return None  # 行内已有正文（并非新行）
-        if self.log:
-            self.log.info("测得自动缩进 %d 列 (repr=%r)", cols, text)
-        return cols
-
-    def _force_indent(self, cols: int, dismiss: bool) -> None:
-        """Ctrl+L 选中当前行，再用目标缩进替换：与编辑器的自动缩进无关，结果精确。"""
-        self._select_line(dismiss)
-        style = self.options["indent_style"]
-        self._type_indent(build_indent(cols, style, int(self.options["tab_size"])), dismiss)
+        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
+        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
+        _send_inputs(
+            _vk_input(_VK_SHIFT, False),
+            _vk_input(_VK_END, False),
+            _vk_input(_VK_END, True),
+            _vk_input(_VK_SHIFT, True),
+        )
 
     def _tap(self, vk: int, dismiss_suggest: bool = False) -> None:
         # IDE 里回车/制表会被当成"接受补全"，先按 Esc 关掉补全弹窗
@@ -434,12 +350,26 @@ class SendInputTyper:
         self._normal_interval(humanize, interval_ms)
         return True
 
-    def _type_indent(self, indent_str: str, dismiss: bool) -> None:
-        for ch in indent_str:
-            if ch == "\t":
-                self._tap(_VK_TAB, dismiss)
-            else:
-                self._unicode_char(ch)
+    def _type_indent_cols(self, cols: int, dismiss: bool) -> None:
+        """输入 cols 列缩进（调用前通常已选中整行空白，输入会替换选区）。
+
+        spaces：逐字输入空格，保留拟人节奏。
+        tabs：VS Code 的 Tab 键在选中整行时是“缩进整行”、空行时会跳到语言推导
+              缩进，无法精确到目标列；因此把缩进串粘贴覆盖选区，Tab 字符 100% 保真。
+        """
+        if cols <= 0:
+            return
+        tab_size = max(1, int(self.options["tab_size"]))
+        if self.options["indent_style"] == "tabs":
+            # 真机验证：粘贴后必须给 VS Code 足够时间处理（30ms 会被随后键入的正文
+            # 抢先，导致缩进丢失）。0.12s + 0.25s 实测稳定。
+            _set_clipboard_text(build_indent(cols, "tabs", tab_size))
+            time.sleep(0.12)
+            _paste_shortcut()
+            time.sleep(0.25)
+            return
+        for ch in build_indent(cols, "spaces", tab_size):
+            self._unicode_char(ch)
             self._space_interval()
 
     def _press_enter(self, humanize: bool, interval_ms: int, dismiss: bool,
@@ -465,9 +395,9 @@ class SendInputTyper:
         """输入文本，返回被跳过的"非 Unicode"字符数。
 
         indent_mode:
-          vscode — 预测 VS Code+Python 自动缩进，仅补差量（默认）
-          target — 兜底：无视自动缩进，强制到达目标缩进
-          none   — 旧行为：原样逐字
+          human — 逐行对齐：回车后选中该行空白，用目标缩进替换，再逐字输入正文（默认）
+          none  — 原样逐字，不做缩进对齐
+        paste_mode=True 时整段走剪贴板粘贴（最保真，会覆盖剪贴板）。
         """
         if os.name != "nt":
             raise RuntimeError("SendInput 逐字输入仅支持 Windows")
@@ -497,7 +427,7 @@ class SendInputTyper:
         if mode == "none":
             self._type_plain(text, interval_ms, humanize, unicode_only, dismiss)
         else:
-            self._type_code(text, interval_ms, humanize, unicode_only, dismiss, mode)
+            self._type_code(text, interval_ms, humanize, unicode_only, dismiss)
         return self.skipped
 
     def _type_plain(self, text: str, interval_ms: int, humanize: bool,
@@ -515,13 +445,14 @@ class SendInputTyper:
                 self.typed += 1
 
     def _type_code(self, text: str, interval_ms: int, humanize: bool,
-                   unicode_only: bool, dismiss: bool, mode: str) -> None:
+                   unicode_only: bool, dismiss: bool) -> None:
+        """逐行对齐输入：每行独立处理缩进，正文仍逐字输入以保留拟人节奏。
+
+        首行不整行替换（避免毁掉光标所在行已有内容）；其余行先回车，
+        再选中该行空白并用目标缩进替换，然后输入正文。
+        """
         tab_size = int(self.options["tab_size"])
         lines = split_code_lines(text, tab_size)
-        depth = 0
-        base = 0
-        prev_body = ""
-        prev_cols = 0
 
         for index, (cols, body) in enumerate(lines):
             if self._stop.is_set():
@@ -529,22 +460,12 @@ class SendInputTyper:
                 break
 
             if index == 0:
-                self._force_indent(cols, dismiss)
+                self._type_indent_cols(cols, dismiss)
             else:
-                self._press_enter(humanize, int(interval_ms), dismiss,
-                                  bool(self.options["enter_via_paste"]))
-                if mode == "target":
-                    self._force_indent(cols, dismiss)
-                else:  # vscode：测量实际自动缩进，必要时用目标缩进替换
-                    actual = self._measure_indent(dismiss)
-                    if actual == cols:
-                        self._tap(_VK_END, False)  # 缩进已正确，折叠选区到行尾
-                    else:
-                        # 选区仍覆盖整行，直接用目标缩进替换
-                        self._type_indent(
-                            build_indent(cols, self.options["indent_style"], tab_size),
-                            dismiss,
-                        )
+                # 代码模式一律用真实回车，避免剪贴板竞态与不触发自动缩进的问题
+                self._press_enter(humanize, int(interval_ms), dismiss, False)
+                self._select_line_content(dismiss)
+                self._type_indent_cols(cols, dismiss)
 
             for ch in body:
                 if self._stop.is_set():
@@ -554,12 +475,6 @@ class SendInputTyper:
                     self.typed += 1
             if self.stopped:
                 break
-
-            bd = bracket_delta(body)
-            if depth == 0 and bd > 0:
-                base = cols
-            depth = max(0, depth + bd)
-            prev_body, prev_cols = body, cols
 
     @staticmethod
     def _unicode_char(ch: str) -> None:

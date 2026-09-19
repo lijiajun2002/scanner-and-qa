@@ -21,7 +21,7 @@ DEFAULTS: dict = {
     "type_typo_pause_max_ms": 300,
     "type_enter_via_paste": False,
     "type_space_interval_ms": 15,
-    "type_indent_mode": "vscode",
+    "type_indent_mode": "human",
     "type_indent_style": "spaces",
     "type_tab_size": 4,
     "type_clean_invisibles": True,

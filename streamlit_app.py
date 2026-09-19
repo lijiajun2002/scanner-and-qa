@@ -255,13 +255,13 @@ with tab_kb:
     st.text_area("要输入到 B 的文本", key="type_text", height=160)
 
     indent_labels = {
-        "vscode-python（模型预测，推荐）": "vscode",
-        "target-indent（兜底：强制到目标缩进）": "target",
-        "不处理（原样逐字）": "none",
+        "human（拟人逐行：逐行对齐缩进后逐字输入，推荐）": "human",
+        "不处理（原样逐字，不做缩进对齐）": "none",
     }
-    saved_mode = settings.get("type_indent_mode", "vscode")
-    default_label = next((k for k, v in indent_labels.items() if v == saved_mode),
-                         "vscode-python（模型预测，推荐）")
+    saved_mode = settings.get("type_indent_mode", "human")
+    if saved_mode not in indent_labels.values():
+        saved_mode = "human"
+    default_label = next(k for k, v in indent_labels.items() if v == saved_mode)
     indent_mode = indent_labels[st.selectbox(
         "缩进策略", list(indent_labels), index=list(indent_labels).index(default_label)
     )]
@@ -293,7 +293,8 @@ with tab_kb:
     )
     enter_via_paste = st.checkbox(
         "换行用粘贴插入（仅“不处理”模式）",
-        value=bool(settings.get("type_enter_via_paste", False)), disabled=paste_mode,
+        value=bool(settings.get("type_enter_via_paste", False)),
+        disabled=(paste_mode or indent_mode != "none"),
     )
 
     with st.expander("⚙️ 高级：拟人化参数（可调，Ctrl+Shift+Alt+0 也使用）"):

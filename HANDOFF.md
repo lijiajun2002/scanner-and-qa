@@ -1,6 +1,6 @@
 # Scanner & QA — 交接文档
 
-> 状态：可用，但 **B 端往 IDE（VS Code）里的键盘输出仍不稳定（缩进问题）**。下一步就是专门优化这一块。
+> 状态：可用。B 端键盘输出的缩进问题已修复（改为「行内容选中 + 目标缩进替换」的确定性方案，见第 5 节）。
 
 ---
 
@@ -75,41 +75,38 @@
 
 ---
 
-## 5. 键盘输出（当前重点 & 现存问题）
+## 5. 键盘输出（缩进方案）
 
-### 已实现
+### 实现
 `b_client/capture_agent.py` 的 `SendInputTyper`：
 
-- 逐字注入：可用 `SendInput + KEYEVENTF_UNICODE`（支持中文/emoji），或整段/剪贴板粘贴。
+- 逐字注入：`SendInput + KEYEVENTF_UNICODE`（支持中文/emoji）；整段走 `paste_mode` 粘贴。
 - 拟人化：字符间隔随机、换行停顿、低频错字后 Backspace 纠正。
 - `space_interval_ms`：空格与缩进走独立高速间隔。
 - `unicode_only`：跳过非 BMP/代理字符。
 - 预处理：EOL 归一、清理 NBSP/全角空格/零宽/智能引号、行首 Tab 按 tab stop 展开。
 - 代码模式 `indent_mode`：
-  - `vscode`（默认）：回车后**实测**编辑器自动缩进，再按目标缩进替换；
-  - `target`：直接强制到目标缩进；
-  - `none`：原样逐字。
-- 实测手段：`Ctrl+L`（VS Code = Expand Line Selection）选中整行 → `Ctrl+C` → 读剪贴板得到该行空白 → 解析列数；`_force_indent()` 用 `Ctrl+L` 选中后用目标缩进替换。
+  - `human`（默认，页面选「拟人逐行」）：**逐行对齐** —— 回车后用 `Home`×2 + `Shift+End` 选中该行内容（此时只含编辑器自动缩进空白），再逐字输入「目标缩进 + 正文」替换选区。不读剪贴板、不测量、不删换行，且能保留逐字节奏。
+  - `none`：原样逐字，不做缩进对齐（换行可选 `enter_via_paste`）。
+- 首行不整行替换，直接在光标处输入，避免毁掉光标所在行已有内容。
 - 缩进风格：`indent_style = spaces|tabs`，`tab_size`。
-- 全局热键：组合由 S 的 `/hotkeys` 下发，B 启动时拉取、每 60s 同步并热注册；解析支持 `ctrl/shift/alt/win` + 字母/数字/`minus`/`plus`/功能键。
+  - `spaces`：逐字输入空格（保留拟人节奏）。
+  - `tabs`：把缩进串（Tab 字符）粘贴覆盖选区。**不能用 Tab 键**——VS Code 的 Tab 是智能命令：选中整行时是「缩进整行」，空行时会跳到语言推导缩进，无法精确到目标列（依据 `cursorTypeEditOperations.TabOperation`）。粘贴后需给 VS Code 足够处理时间（`0.12s` + `0.25s`）——真机实测 30ms 会被随后键入的正文抢先，导致缩进丢失。
+  - 注：控制字符 `\t`/`\n` 不能走 Unicode 注入（真机实测会被 VS Code 丢弃），换行必须用 `VK_RETURN`。
+- 全局热键：组合由 S 的 `/hotkeys` 下发，B 启动时拉取、每 60s 同步并热注册。
 
-### 现存问题（下一步要解决）
-- 用户实测：**在 VS Code 里缩进仍不对**。历史上出现过：
-  - `target` 模式：换行处"来回跳跃"，最后只剩一个空格；
-  - `vscode` 模式：干脆没有任何缩进；
-  - 早前还出现过"换行符被换成 tab / 没有换行"（已试过用剪贴板换行，但 10ms 极速间隔下不可靠）。
-- 目前的修复方向刚改为"`Ctrl+L` 选中行 + 实测/替换缩进"，**尚未在真实 VS Code 上验证**。
-- 需重点确认的假设：
-  1. VS Code 的 `Ctrl+L` 默认是 `expandLineSelection`，且只选中该行文本（不含换行）；
-  2. 回车后光标位于自动缩进之后、该行为纯空白；
-  3. `Ctrl+C` 复制到剪贴板的时序足够（当前 6×40ms 重试）；
-  4. 目标文件被识别为 Python（否则冒号/括号的自动缩进模型不成立）。
-- 调试线索：B 的日志 `%LOCALAPPDATA%\scanner-qa\agent.log` 会打印 `测得自动缩进 N 列 (repr=...)`——这是定位的关键。
+### 关键结论（历史 bug 根因）
+旧方案用 `Ctrl+L` 选中行再 `Ctrl+C` 读剪贴板「实测」缩进。VS Code 的 `Ctrl+L`（`expandLineSelection`）选中范围是 `(N,1) → (N+1,1)`，**包含行尾换行**；且空行时 `Ctrl+C` 是 no-op，剪贴板会保留旧内容。于是实测恒为 `None/脏值`，而按目标缩进输入时又把换行一起替换掉 → 串行/丢行/无缩进。现已彻底移除对 `Ctrl+L`/`Ctrl+C`/剪贴板测量的依赖。
 
-### 更稳的兜底思路（供下一步参考）
-- 用 `editor.autoIndent: none` + `editor.formatOnPaste: false` 配合，让实测值恒为 0，再用目标缩进补齐。
-- 或彻底走"整段/逐行剪贴板粘贴"（缩进 100% 保真，但失去逐字节奏）。
-- 或对每行：`Ctrl+L` 选中 → 直接输入「目标缩进 + 正文」替换整行（行级粘贴，保留行间节奏）。
+### 为什么 `Home`×2 + `Shift+End` 是可靠的（VS Code 源码依据）
+- `Home` = `MoveOperations.moveToBeginningOfLine`：`firstNonBlank = getLineFirstNonWhitespaceColumn || minColumn`。回车后该行只有自动缩进空白，游标在行尾 ≠ 行首，故第一次 `Home` 到第 1 列，第二次仍在第 1 列。
+- `Shift+End` = `moveToEndOfLine`（选择），选到行末但不含换行。
+- 纯空白选区不会触发「输入括号/引号包裹选区」（`SurroundSelectionOperation._isSurroundSelectionType` 对 only-whitespace 返回 false），所以替换选区安全。
+
+### 建议的 VS Code 设置
+- `editor.insertSpaces` / `editor.tabSize` 与页面「缩进字符 / tab 宽度」保持一致（文件用 Tab 就选 tabs，用空格就选 spaces；混用会导致 Python `TabError`）。
+- 无需关闭 `editor.autoIndent`（`human` 模式对自动缩进不敏感）。
+- 建议关闭或保持默认的自动闭合括号/引号均可；如出现异常配对/补全，页面保持「IDE 兼容：回车/制表前先按 Esc」勾选。
 
 ---
 
@@ -143,38 +140,39 @@ b_client\run_source.bat
 - S 主机：Ubuntu 24.04，X11（`DISPLAY=:1`），Docker。
 - 容器：`python:3.12-slim` + Streamlit 1.64（用到 `st.button(shortcut=...)`、`st.fragment(run_every=...)`、`st.iframe`）。
 - B：Windows。
-- 当前 `data/settings.json` 实际值（节选）：模型 `deepseek-v4.1-flash`、`max_tokens=1088`、`b_api_token=admin`、`prompt` 为"用python做这道题…只回答答案"、`type_enter_via_paste=true`、字符/换行间隔被压到 10ms（**这是压测值，会破坏剪贴板时序，应调回**）。
+- 当前 `data/settings.json` 实际值（节选）：模型 `deepseek-v4.1-flash`、`max_tokens=1088`、`prompt` 为"用python做这道题…只回答答案"、`type_enter_via_paste=true`、字符/换行间隔 50ms（页面可调）。注意：`human` 模式不使用剪贴板，`enter_via_paste` 只在 `indent_mode=none` 时生效；若把间隔压到 10ms 以下，可能影响 `paste_mode`/`none` 的剪贴板时序。
 - 安全：`/pending`、`/frame`、`/action`、`/hotkeys` 都需 token；该通道能向 B 注入任意按键，**勿暴露公网**，仅限局域网。
 
 ---
 
 ## 8. 测试
 
-仓库内无正式测试套件；开发期用 `/tmp/opencode/` 下的临时脚本验证（未入库），包括：
-- `test_typer.py`：注入器纯函数与各种模式（打桩，Linux 可跑）。
-- `test_hotkeys.py`：热键解析/映射/重映射。
-- `test_orchestration.py`：服务端动作/抽离/清空/参数透传（内嵌 mock LLM）。
-- `test_streamlit_*.py`：AppTest 验证 UI 与快捷键。
+- `tests/test_typer.py`：注入器纯函数与各模式的动作序列（打桩，Linux 可跑）：`python tests/test_typer.py`。
+- `tests/test_vscode_sim.py`：**VS Code 编辑器语义模拟器**，按源码实现 `Home`/`Shift+End`/`Enter` 自动缩进/`Tab`/括号自动配对，用真实文本跑注入器并逐行比对。含空格/制表、有无自动缩进、追加/中段插入等场景：`python tests/test_vscode_sim.py`。
+- 另有开发期 `/tmp/opencode/` 下的临时脚本（未入库）：`test_hotkeys.py`、`test_orchestration.py`、`test_streamlit_*.py`。
+- 建议后续把这些也整理进 `tests/` 并接入 CI。注意：模拟器只能证明「在建模的 VS Code 语义下正确」，最终仍需在真实 Windows/VS Code 上验收。
 
-如需长期维护，建议把这些整理进 `tests/` 并接入 CI。
+### 真机验收记录（已做）
+在 B（Windows，VS Code，交互会话）上用 `SendInput` 对真实 VS Code 输入《接雨水》示例并 `Ctrl+S` 后回读文件：
+- `indent_style=spaces`：PASS
+- `indent_style=tabs`：PASS（需上面的粘贴 settle 时间）
+- 验证方法：`explorer.exe`/计划任务在会话 1 启动一个新 VS Code 窗口 → 输入 → 保存 → 读取文件比对。
 
 ---
 
-## 9. 下一步（明确）
+## 9. 下一步（可选）
 
-**进一步优化 B 端在 IDE（VS Code）中的键盘输出，尤其是缩进。**
+键盘缩进问题已按第 5 节方案修复。后续可选：
 
-需要做的事：
-1. 在真实 VS Code 上验证当前 `Ctrl+L` + 实测/替换方案；读取 `agent.log` 的 `测得自动缩进` 行。
-2. 决定并实现更稳的缩进策略（见第 5 节"更稳的兜底思路"的三个方向），可能同时保留"逐字/逐行粘贴"备选。
-3. 处理缩进之外仍可能影响 IDE 的因素：自动补全弹窗、括号/引号自动配对、`Tab` 语义、`autoIndent` 设置。
-4. 把关键 VS Code 设置写进使用说明（`editor.autoIndent`、`formatOnPaste`、`insertSpaces`、`tabSize`）。
-5. 建议补一套可离线运行的注入器测试，覆盖更真实的 VS Code 行为。
+1. 在真实 VS Code 上验证 `human` 模式（建议先用 `run_source.bat` 免构建验证）；观察日志 `%LOCALAPPDATA%\scanner-qa\agent.log`。
+2. 视需要补充「整段粘贴」与 `human` 模式的一键切换体验（页面已有缩进策略 + 整段粘贴选项）。
+3. 处理缩进之外仍可能影响 IDE 的因素：自动补全弹窗、括号/引号自动配对。
+4. 将 `/tmp/opencode` 的临时测试并入 `tests/` 并接入 CI。
 
 ---
 
 ## 10. 已知取舍（供决策）
 
-- **逐字模拟 vs 保真**：逐字更像真人但易被自动补全/自动缩进干扰；整段粘贴最保真但失去节奏。当前两者都支持，默认偏逐字 + 实测修正。
+- **逐字模拟 vs 保真**：`human` 模式逐字更像真人、保留行间节奏且缩进确定；`paste_mode` 整段粘贴最保真但失去节奏。
 - **服务端单例会话**：多个浏览器窗口共享同一份图片/对话，`清空` 会影响所有窗口。
 - **图片不落盘**，但**设置（含 API Key）明文落盘**在 `data/settings.json`（按用户要求保持现状）。

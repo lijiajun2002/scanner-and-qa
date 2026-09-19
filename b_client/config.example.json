@@ -19,7 +19,7 @@
   "dismiss_suggest": true,
   "dismiss_delay_ms": 80,
   "enter_via_paste": false,
-  "indent_mode": "vscode",
+  "indent_mode": "human",
   "indent_style": "spaces",
   "tab_size": 4,
   "clean_invisibles": true
