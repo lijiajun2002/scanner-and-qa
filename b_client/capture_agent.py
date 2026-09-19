@@ -7,11 +7,13 @@
 同时注册全局热键（Ctrl+Shift+Alt+8 截屏 / +9 分析 / +0 输入回答 / +- 清空对话 / ++ 停止输入）。
 
 中文/Unicode 用 SendInput + KEYEVENTF_UNICODE 逐字注入，不占用剪贴板、不受输入法/键盘布局影响。
-打字任务可选：
-  - humanize=True：字符间隔 50–120ms 随机、换行后停顿 300–1000ms、0.5% 错字后 Backspace 纠正
-  - unicode_only=True：跳过无法作为单个 Unicode 码点发送的字符（emoji、代理区等）
-  - dismiss_suggest=True：回车/制表前先按 Esc 关掉 IDE 自动补全弹窗
-  - paste_mode=True：整段走剪贴板粘贴，绕过 IDE 补全/自动配对（会覆盖剪贴板）
+代码缩进策略（indent_mode）：
+  - vscode：预测 VS Code + Python 的自动缩进，仅补差量（默认）
+  - target：兜底，无视自动缩进，用 Home×2 + Shift+End 选中后重打目标缩进
+  - none  ：原样逐字
+其它参数：indent_style(spaces/tabs)、tab_size、space_interval_ms(空格/缩进专用高速间隔)、
+  clean_invisibles、dismiss_suggest/dismiss_delay_ms、humanize/typo_* 等，均可由 S 端网页下发。
+全局热键组合由 S 端 /hotkeys 下发（默认 ctrl+shift+alt+8/9/0/minus/plus）。
 
 运行方式（二选一）：
   1. 源码：pythonw capture_agent.py
@@ -66,8 +68,9 @@ DEFAULTS = {
     "jpeg_quality": 85,
     "scale": 1.0,
     "poll_wait": 25,
-    # 全局热键总开关：Ctrl+Shift+Alt+8/9/0/-/+（Windows 虚拟键码判定）
+    # 全局热键总开关：具体组合由 S 端网页下发（/hotkeys），可用 hotkeys 覆盖
     "hotkeys_enabled": True,
+    "hotkeys": {},
 }
 
 
@@ -119,6 +122,11 @@ if os.name == "nt":
     _VK_ESCAPE = 0x1B
     _VK_CONTROL = 0x11
     _VK_V = 0x56
+    _VK_SHIFT = 0x10
+    _VK_HOME = 0x24
+    _VK_END = 0x23
+    _VK_L = 0x4C
+    _VK_C = 0x43
     _CF_UNICODETEXT = 13
     _GMEM_MOVEABLE = 0x0002
 
@@ -178,6 +186,27 @@ if os.name == "nt":
             _vk_input(_VK_CONTROL, True),
         )
 
+    _user32.GetClipboardData.argtypes = [wintypes.UINT]
+    _user32.GetClipboardData.restype = wintypes.HANDLE
+
+    def _get_clipboard_text() -> str:
+        """读取剪贴板文本（用于测量 IDE 的实际缩进）。"""
+        if not _user32.OpenClipboard(None):
+            return ""
+        try:
+            handle = _user32.GetClipboardData(_CF_UNICODETEXT)
+            if not handle:
+                return ""
+            ptr = _kernel32.GlobalLock(handle)
+            if not ptr:
+                return ""
+            try:
+                return ctypes.c_wchar_p(ptr).value or ""
+            finally:
+                _kernel32.GlobalUnlock(handle)
+        finally:
+            _user32.CloseClipboard()
+
 
 # 输入行为的默认参数（可在 config.json 覆盖）
 TYPING_DEFAULTS = {
@@ -185,27 +214,126 @@ TYPING_DEFAULTS = {
     "interval_max_ms": 1000,     # 字符间隔上限
     "line_pause_min_ms": 1000,   # 换行后停顿下限
     "line_pause_max_ms": 2000,   # 换行后停顿上限
+    "space_interval_ms": 15,     # 空格/缩进的专用高速间隔
     "typo_rate": 0.005,          # 每字符出错概率
     "typo_pause_min_ms": 100,    # 错字后停顿下限
     "typo_pause_max_ms": 300,    # 错字后停顿上限
     "dismiss_suggest": True,     # 回车/制表前先按 Esc 关掉 IDE 自动补全弹窗
+    "dismiss_delay_ms": 80,      # Esc 与特殊键之间的等待
+    "enter_via_paste": False,    # 换行用剪贴板粘贴插入（non-code 模式可用）
+    "indent_mode": "vscode",     # vscode / target / none
+    "indent_style": "spaces",    # spaces / tabs
+    "tab_size": 4,
+    "clean_invisibles": True,    # 清理 NBSP/全角空格/零宽/智能引号
 }
 
 _TYPO_POOL = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+# ---- 文本预处理：归一化 / 拆行 / 缩进预测（纯函数，便于测试） ----
+_INVISIBLE_MAP = {0x00A0: " ", 0x3000: " "}
+_ZERO_WIDTH = {0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF}
+_SMART_MAP = {
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2212": "-",
+}
+
+
+def normalize_code_text(text: str, clean: bool = True) -> str:
+    """统一换行；可选清理不可见/易错字符。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not clean:
+        return text
+    out = []
+    for ch in text:
+        if ord(ch) in _ZERO_WIDTH:
+            continue
+        out.append(_SMART_MAP.get(ch, _INVISIBLE_MAP.get(ord(ch), ch)))
+    return "".join(out)
+
+
+def split_code_lines(text: str, tab_size: int = 4) -> list[tuple[int, str]]:
+    """返回 [(缩进列数, 正文)]；行首 Tab 按 tab stop 展开计列。"""
+    lines: list[tuple[int, str]] = []
+    for raw in text.split("\n"):
+        cols = 0
+        i = 0
+        while i < len(raw) and raw[i] in (" ", "\t"):
+            if raw[i] == "\t":
+                cols += tab_size - (cols % tab_size)
+            else:
+                cols += 1
+            i += 1
+        lines.append((cols, raw[i:]))
+    if text.endswith("\n") and lines:
+        lines.pop()  # 末尾换行不产生额外空行
+    return lines
+
+
+def build_indent(cols: int, style: str, tab_size: int) -> str:
+    if style == "tabs":
+        return "\t" * (cols // tab_size) + " " * (cols % tab_size)
+    return " " * cols
+
+
+def bracket_delta(body: str) -> int:
+    """计算一行括号净变化，忽略字符串与 # 注释。"""
+    depth = 0
+    quote = None
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == "#":
+            break
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        i += 1
+    return depth
+
+
+def predict_indent(prev_body: str, prev_cols: int, bracket_depth: int,
+                   bracket_base: int, tab_size: int) -> int:
+    """预测 VS Code + Python 回车后自动缩进到的列数。"""
+    if bracket_depth > 0:
+        return bracket_base + tab_size
+    if prev_body.rstrip().endswith(":"):
+        return prev_cols + tab_size
+    return prev_cols
 
 
 class SendInputTyper:
     """用 Windows SendInput 逐字注入文本，可选拟人化节奏与纯 Unicode 过滤。"""
 
     def __init__(self, options: dict | None = None) -> None:
-        self.options = dict(TYPING_DEFAULTS)
+        self._base = dict(TYPING_DEFAULTS)
         if options:
-            self.options.update({k: options[k] for k in TYPING_DEFAULTS if k in options})
+            self._base.update({k: options[k] for k in TYPING_DEFAULTS if k in options})
+        self.options = dict(self._base)
         self.skipped = 0
         self.typed = 0
         self.stopped = False
+        self.log = None
         self._stop = threading.Event()
 
+    def set_options(self, overrides: dict | None) -> None:
+        """按任务覆盖拟人化参数（min>max 时自动交换）。"""
+        self.options = dict(self._base)
+        if overrides:
+            self.options.update({k: overrides[k] for k in TYPING_DEFAULTS if k in overrides})
+        for lo, hi in (("interval_min_ms", "interval_max_ms"),
+                       ("line_pause_min_ms", "line_pause_max_ms"),
+                       ("typo_pause_min_ms", "typo_pause_max_ms")):
+            if self.options[lo] > self.options[hi]:
+                self.options[lo], self.options[hi] = self.options[hi], self.options[lo]
     def stop(self) -> None:
         """请求停止当前输入（供停止热键调用）。"""
         self._stop.set()
@@ -223,25 +351,123 @@ class SendInputTyper:
 
     def _normal_interval(self, humanize: bool, fixed_ms: int) -> None:
         if humanize:
-            span = self.options
-            time.sleep(random.uniform(span["interval_min_ms"], span["interval_max_ms"]) / 1000.0)
+            time.sleep(random.uniform(self.options["interval_min_ms"],
+                                      self.options["interval_max_ms"]) / 1000.0)
         elif fixed_ms:
             time.sleep(fixed_ms / 1000.0)
 
-    def _tap(self, vk: int, dismiss_suggest: bool) -> None:
+    def _space_interval(self) -> None:
+        time.sleep(self.options["space_interval_ms"] / 1000.0)
+
+    def _ctrl_key(self, vk: int) -> None:
+        _send_inputs(
+            _vk_input(_VK_CONTROL, False),
+            _vk_input(vk, False),
+            _vk_input(vk, True),
+            _vk_input(_VK_CONTROL, True),
+        )
+
+    def _select_line(self, dismiss: bool) -> None:
+        if dismiss:
+            _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
+            time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
+        self._ctrl_key(_VK_L)  # VS Code：选中当前整行
+
+    def _measure_indent(self, dismiss: bool) -> int | None:
+        """Ctrl+L 选中当前行 → Ctrl+C → 读剪贴板，返回实际缩进列数（失败返回 None）。"""
+        self._select_line(dismiss)
+        self._ctrl_key(_VK_C)
+        text = ""
+        for _ in range(6):
+            time.sleep(0.04)
+            text = _get_clipboard_text()
+            if text:
+                break
+        if "\n" in text or "\r" in text:
+            return None  # 选中包含换行，别用它替换
+        cols = 0
+        for ch in text:
+            if ch == "\t":
+                size = int(self.options["tab_size"])
+                cols += size - (cols % size)
+            elif ch == " ":
+                cols += 1
+            else:
+                return None  # 行内已有正文（并非新行）
+        if self.log:
+            self.log.info("测得自动缩进 %d 列 (repr=%r)", cols, text)
+        return cols
+
+    def _force_indent(self, cols: int, dismiss: bool) -> None:
+        """Ctrl+L 选中当前行，再用目标缩进替换：与编辑器的自动缩进无关，结果精确。"""
+        self._select_line(dismiss)
+        style = self.options["indent_style"]
+        self._type_indent(build_indent(cols, style, int(self.options["tab_size"])), dismiss)
+
+    def _tap(self, vk: int, dismiss_suggest: bool = False) -> None:
         # IDE 里回车/制表会被当成"接受补全"，先按 Esc 关掉补全弹窗
         if dismiss_suggest:
             _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
-            time.sleep(0.03)
+            time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
         _send_inputs(_vk_input(vk, False), _vk_input(vk, True))
+
+    def _type_char(self, ch: str, humanize: bool, interval_ms: int,
+                   unicode_only: bool, dismiss: bool) -> bool:
+        """输入一个字符：空格/制表走高速通道；返回 False 表示被跳过。"""
+        if ch == " ":
+            self._unicode_char(" ")
+            self._space_interval()
+            return True
+        if ch == "\t":
+            self._tap(_VK_TAB, dismiss)
+            self._space_interval()
+            return True
+        if unicode_only and not self._sendable_unicode(ch):
+            self.skipped += 1
+            return False
+        if humanize and random.random() < self.options["typo_rate"]:
+            self._unicode_char(random.choice(_TYPO_POOL))
+            time.sleep(random.uniform(self.options["typo_pause_min_ms"],
+                                      self.options["typo_pause_max_ms"]) / 1000.0)
+            _send_inputs(_vk_input(_VK_BACK, False), _vk_input(_VK_BACK, True))
+        self._unicode_char(ch)
+        self._normal_interval(humanize, interval_ms)
+        return True
+
+    def _type_indent(self, indent_str: str, dismiss: bool) -> None:
+        for ch in indent_str:
+            if ch == "\t":
+                self._tap(_VK_TAB, dismiss)
+            else:
+                self._unicode_char(ch)
+            self._space_interval()
+
+    def _press_enter(self, humanize: bool, interval_ms: int, dismiss: bool,
+                     enter_via_paste: bool) -> None:
+        if enter_via_paste:
+            if dismiss:
+                _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
+                time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
+            _set_clipboard_text("\n")
+            time.sleep(0.02)
+            _paste_shortcut()
+        else:
+            self._tap(_VK_RETURN, dismiss)
+        if humanize:
+            time.sleep(random.uniform(self.options["line_pause_min_ms"],
+                                      self.options["line_pause_max_ms"]) / 1000.0)
+        elif interval_ms:
+            time.sleep(interval_ms / 1000.0)
 
     def type_text(self, text: str, interval_ms: int, start_delay_s: float,
                   humanize: bool = True, unicode_only: bool = False,
                   dismiss_suggest: bool | None = None, paste_mode: bool = False) -> int:
         """输入文本，返回被跳过的"非 Unicode"字符数。
 
-        paste_mode=True：整段走剪贴板粘贴，绕过 IDE 自动补全/自动配对，最可靠。
-        否则逐字输入；dismiss_suggest=True 时回车/制表前先按 Esc 关掉补全弹窗。
+        indent_mode:
+          vscode — 预测 VS Code+Python 自动缩进，仅补差量（默认）
+          target — 兜底：无视自动缩进，强制到达目标缩进
+          none   — 旧行为：原样逐字
         """
         if os.name != "nt":
             raise RuntimeError("SendInput 逐字输入仅支持 Windows")
@@ -253,6 +479,7 @@ class SendInputTyper:
         self.typed = 0
         self.stopped = False
         self._stop.clear()
+
         if paste_mode:
             if self._stop.is_set():
                 self.stopped = True
@@ -264,42 +491,75 @@ class SendInputTyper:
             return 0
 
         dismiss = self.options["dismiss_suggest"] if dismiss_suggest is None else dismiss_suggest
+        text = normalize_code_text(text, bool(self.options["clean_invisibles"]))
+        mode = self.options["indent_mode"]
 
+        if mode == "none":
+            self._type_plain(text, interval_ms, humanize, unicode_only, dismiss)
+        else:
+            self._type_code(text, interval_ms, humanize, unicode_only, dismiss, mode)
+        return self.skipped
+
+    def _type_plain(self, text: str, interval_ms: int, humanize: bool,
+                    unicode_only: bool, dismiss: bool) -> None:
         for ch in text:
             if self._stop.is_set():
                 self.stopped = True
                 break
-            if unicode_only and not self._sendable_unicode(ch):
-                self.skipped += 1
-                continue
-
-            if ch in ("\n", "\r"):
-                self._tap(_VK_RETURN, dismiss)
+            if ch == "\n":
+                self._press_enter(humanize, int(interval_ms), dismiss,
+                                  bool(self.options["enter_via_paste"]))
                 self.typed += 1
-                if humanize:
-                    time.sleep(random.uniform(self.options["line_pause_min_ms"],
-                                              self.options["line_pause_max_ms"]) / 1000.0)
-                elif interval_ms:
-                    time.sleep(interval_ms / 1000.0)
                 continue
-
-            if ch == "\t":
-                self._tap(_VK_TAB, dismiss)
+            if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
                 self.typed += 1
-                self._normal_interval(humanize, int(interval_ms))
-                continue
 
-            # 低频错字：打错 -> 停顿 -> Backspace -> 再打正确的
-            if humanize and random.random() < self.options["typo_rate"]:
-                self._unicode_char(random.choice(_TYPO_POOL))
-                time.sleep(random.uniform(self.options["typo_pause_min_ms"],
-                                          self.options["typo_pause_max_ms"]) / 1000.0)
-                _send_inputs(_vk_input(_VK_BACK, False), _vk_input(_VK_BACK, True))
+    def _type_code(self, text: str, interval_ms: int, humanize: bool,
+                   unicode_only: bool, dismiss: bool, mode: str) -> None:
+        tab_size = int(self.options["tab_size"])
+        lines = split_code_lines(text, tab_size)
+        depth = 0
+        base = 0
+        prev_body = ""
+        prev_cols = 0
 
-            self._unicode_char(ch)
-            self.typed += 1
-            self._normal_interval(humanize, int(interval_ms))
-        return self.skipped
+        for index, (cols, body) in enumerate(lines):
+            if self._stop.is_set():
+                self.stopped = True
+                break
+
+            if index == 0:
+                self._force_indent(cols, dismiss)
+            else:
+                self._press_enter(humanize, int(interval_ms), dismiss,
+                                  bool(self.options["enter_via_paste"]))
+                if mode == "target":
+                    self._force_indent(cols, dismiss)
+                else:  # vscode：测量实际自动缩进，必要时用目标缩进替换
+                    actual = self._measure_indent(dismiss)
+                    if actual == cols:
+                        self._tap(_VK_END, False)  # 缩进已正确，折叠选区到行尾
+                    else:
+                        # 选区仍覆盖整行，直接用目标缩进替换
+                        self._type_indent(
+                            build_indent(cols, self.options["indent_style"], tab_size),
+                            dismiss,
+                        )
+
+            for ch in body:
+                if self._stop.is_set():
+                    self.stopped = True
+                    break
+                if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
+                    self.typed += 1
+            if self.stopped:
+                break
+
+            bd = bracket_delta(body)
+            if depth == 0 and bd > 0:
+                base = cols
+            depth = max(0, depth + bd)
+            prev_body, prev_cols = body, cols
 
     @staticmethod
     def _unicode_char(ch: str) -> None:
@@ -390,28 +650,71 @@ def post_action(base: str, headers: dict, log: logging.Logger, action: str,
         log.warning("投递热键动作失败: %s", exc)
 
 
-# ============================ 全局热键 ============================
-# Ctrl+Shift+Alt + 主键盘 8/9/0/-/=（+）；Windows 用虚拟键码判定，避免 Shift 改写字符。
-_VK_ACTION = {
-    0x38: "capture",       # 8
-    0x39: "analyze",       # 9
-    0x30: "type_answer",   # 0
-    0xBD: "clear",         # 主键盘 -
-    0xBB: "stop_type",     # 主键盘 = / +
-    0x6D: "clear",         # 小键盘 -
-    0x6B: "stop_type",     # 小键盘 +
-}
-_CHAR_ACTION = {
-    "8": "capture", "9": "analyze", "0": "type_answer",
-    "-": "clear", "=": "stop_type", "+": "stop_type",
+# ============================ 全局热键（网页可配置） ============================
+_DEFAULT_HOTKEYS = {
+    "capture": "ctrl+shift+alt+8",
+    "analyze": "ctrl+shift+alt+9",
+    "type_answer": "ctrl+shift+alt+0",
+    "clear": "ctrl+shift+alt+minus",
+    "stop": "ctrl+shift+alt+plus",
 }
 _MOD_CTRL = {"ctrl", "ctrl_l", "ctrl_r"}
 _MOD_SHIFT = {"shift", "shift_l", "shift_r"}
 _MOD_ALT = {"alt", "alt_l", "alt_r", "alt_gr"}
+_MOD_WIN = {"cmd", "cmd_l", "cmd_r"}
+_VK_NAMES = {
+    "space": 0x20, "tab": 0x09, "enter": 0x0D, "return": 0x0D, "escape": 0x1B,
+    "esc": 0x1B, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
+    "minus": 0xBD, "-": 0xBD, "plus": 0xBB, "=": 0xBB, "equal": 0xBB,
+}
+
+
+def token_to_vk(token: str) -> int | None:
+    token = token.lower()
+    if token in _VK_NAMES:
+        return _VK_NAMES[token]
+    if len(token) == 1 and token.isalnum():
+        return ord(token.upper())
+    if token.startswith("f") and token[1:].isdigit():
+        n = int(token[1:])
+        if 1 <= n <= 24:
+            return 0x70 + n - 1
+    return None
+
+
+def parse_hotkey(combo: str):
+    """把 'ctrl+shift+alt+8' 解析为 (frozenset(mods), vk)。"""
+    mods = set()
+    vk = None
+    for token in str(combo).lower().replace(" ", "").split("+"):
+        if token in ("ctrl", "control"):
+            mods.add("ctrl")
+        elif token == "shift":
+            mods.add("shift")
+        elif token == "alt":
+            mods.add("alt")
+        elif token in ("win", "super", "meta"):
+            mods.add("win")
+        elif token:
+            value = token_to_vk(token)
+            if value is not None:
+                vk = value
+    if vk is None:
+        return None, None
+    return frozenset(mods), vk
+
+
+def _vk_char(vk: int) -> str | None:
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk).lower()
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)
+    return None
 
 
 class GlobalHotkeys:
-    """Ctrl+Shift+Alt+8/9/0/-/+ 全局热键：另外三键投递动作给 S，+ 键本地停止输入。"""
+    """热键映射来自网页配置；除 stop 本地执行外，其余投递动作给 S。"""
 
     def __init__(self, base: str, headers: dict, log: logging.Logger,
                  typer: "SendInputTyper | None") -> None:
@@ -419,14 +722,31 @@ class GlobalHotkeys:
         self.headers = headers
         self.log = log
         self.typer = typer
-        self.ctrl = self.shift = self.alt = False
+        self.ctrl = self.shift = self.alt = self.win = False
         self.listener = None
+        self._lock = threading.Lock()
+        self._by_key: dict = {}
 
-    def _action_for(self, key) -> str | None:
-        vk = getattr(key, "vk", None)
-        if vk in _VK_ACTION:
-            return _VK_ACTION[vk]
-        return _CHAR_ACTION.get(getattr(key, "char", None))
+    def set_mapping(self, hotkeys: dict) -> None:
+        mapping = {}
+        for action, combo in (hotkeys or {}).items():
+            mods, vk = parse_hotkey(combo)
+            if vk is None:
+                self.log.warning("无法解析热键 %s=%s", action, combo)
+                continue
+            mapping[(mods, "vk", vk)] = action
+            ch = _vk_char(vk)
+            if ch:
+                mapping[(mods, "char", ch)] = action
+        with self._lock:
+            self._by_key = mapping
+        self.log.info("热键映射已更新: %s", hotkeys)
+
+    def _pressed_mods(self) -> frozenset:
+        return frozenset(
+            name for name, on in (("ctrl", self.ctrl), ("shift", self.shift),
+                                  ("alt", self.alt), ("win", self.win)) if on
+        )
 
     def _on_press(self, key) -> None:
         name = getattr(key, "name", None)
@@ -439,9 +759,16 @@ class GlobalHotkeys:
         if name in _MOD_ALT:
             self.alt = True
             return
-        if not (self.ctrl and self.shift and self.alt):
+        if name in _MOD_WIN:
+            self.win = True
             return
-        action = self._action_for(key)
+        mods = self._pressed_mods()
+        vk = getattr(key, "vk", None)
+        ch = getattr(key, "char", None)
+        with self._lock:
+            action = self._by_key.get((mods, "vk", vk))
+            if action is None and ch:
+                action = self._by_key.get((mods, "char", ch.lower()))
         if action:
             self._trigger(action)
 
@@ -453,15 +780,16 @@ class GlobalHotkeys:
             self.shift = False
         elif name in _MOD_ALT:
             self.alt = False
+        elif name in _MOD_WIN:
+            self.win = False
 
     def _trigger(self, action: str) -> None:
-        if action == "stop_type":
+        if action == "stop":
             if self.typer is not None:
                 self.typer.stop()
-                self.log.info("停止热键：已请求停止当前键盘输出")
+                self.log.info("停止热键：已请求停止键盘输出")
             return
-        payload = {"extract": True} if action == "analyze" else None
-        post_action(self.base, self.headers, self.log, action, payload)
+        post_action(self.base, self.headers, self.log, action)
 
     def start(self):
         try:
@@ -474,15 +802,37 @@ class GlobalHotkeys:
                 on_press=self._on_press, on_release=self._on_release)
             self.listener.daemon = True
             self.listener.start()
-            self.log.info("全局热键已启用: Ctrl+Shift+Alt+8/9/0/-/+")
             return self.listener
         except Exception as exc:  # noqa: BLE001
             self.log.warning("启动全局热键失败: %s", exc)
             return None
 
 
-def start_hotkeys(base: str, headers: dict, log: logging.Logger, typer):
-    return GlobalHotkeys(base, headers, log, typer).start()
+def fetch_hotkeys(base: str, headers: dict, log: logging.Logger) -> dict:
+    try:
+        resp = requests.get(f"{base}/hotkeys", headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("hotkeys") or {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("拉取热键配置失败: %s", exc)
+        return {}
+
+
+def start_hotkeys(base: str, headers: dict, log: logging.Logger,
+                  typer, initial: dict):
+    gh = GlobalHotkeys(base, headers, log, typer)
+    gh.set_mapping(initial or _DEFAULT_HOTKEYS)
+    gh.start()
+
+    def sync_loop() -> None:
+        while True:
+            time.sleep(60)
+            hotkeys = fetch_hotkeys(base, headers, log)
+            if hotkeys:
+                gh.set_mapping(hotkeys)
+
+    threading.Thread(target=sync_loop, daemon=True).start()
+    return gh
 
 
 def main() -> int:
@@ -498,9 +848,11 @@ def main() -> int:
     frame_url = f"{base}/frame"
     poll_timeout = int(cfg["poll_wait"]) + 10
     typer = SendInputTyper(cfg)
+    typer.log = log
     log.info("启动: S=%s monitor=%s", base, cfg["monitor"])
     if cfg.get("hotkeys_enabled", True):
-        start_hotkeys(base, headers, log, typer)
+        initial = fetch_hotkeys(base, headers, log) or cfg.get("hotkeys") or _DEFAULT_HOTKEYS
+        start_hotkeys(base, headers, log, typer, initial)
 
     backoff = 1
     with _MSS() as sct:
@@ -528,6 +880,7 @@ def main() -> int:
                 elif kind == "type":
                     text = str(job.get("text", ""))
                     try:
+                        typer.set_options(job.get("options"))
                         skipped = typer.type_text(
                             text,
                             int(job.get("interval_ms", 60)),

@@ -17,6 +17,13 @@ DEFAULT_EXTRACT_PROMPT = (
     "上述所有图片都是同一个题目的截图，请把它们的内容整理成规范、完整、可直接作答的题干。"
 )
 CAPTURE_MIN_INTERVAL = 0.6  # 快捷键连按时，两次被采纳的截屏最小间隔（秒）
+DEFAULT_HOTKEYS = {
+    "capture": "ctrl+shift+alt+8",
+    "analyze": "ctrl+shift+alt+9",
+    "type_answer": "ctrl+shift+alt+0",
+    "clear": "ctrl+shift+alt+minus",
+    "stop": "ctrl+shift+alt+plus",
+}
 
 # 整段被 ``` 包裹的代码块：去掉首尾围栏（含开头的语言标注）
 _FENCE_RE = re.compile(r"^```[^\n]*\r?\n(.*?)\r?\n?```\s*$", re.DOTALL)
@@ -43,6 +50,8 @@ _status = "就绪"
 _extracted = ""
 _use_images = True
 _extract_enabled = False
+_analyze_extract = True
+_typing_options: dict = {}
 _last_answer = ""
 _last_capture_ts = 0.0
 _last_image_hash = ""
@@ -64,8 +73,9 @@ def request_capture() -> None:
 
 def request_type(text: str, interval_ms: int = 60, start_delay_s: float = 3,
                  humanize: bool = True, unicode_only: bool = False,
-                 dismiss_suggest: bool = True, paste_mode: bool = False) -> None:
-    """请求 B 输入文本。"""
+                 dismiss_suggest: bool = True, paste_mode: bool = False,
+                 options: dict | None = None) -> None:
+    """请求 B 输入文本；options 可覆盖 B 端拟人化参数。"""
     _jobs.put({
         "type": "type",
         "text": text,
@@ -75,7 +85,14 @@ def request_type(text: str, interval_ms: int = 60, start_delay_s: float = 3,
         "unicode_only": bool(unicode_only),
         "dismiss_suggest": bool(dismiss_suggest),
         "paste_mode": bool(paste_mode),
+        "options": dict(options or {}),
     })
+
+
+def set_typing_options(options: dict) -> None:
+    """记住网页里调整的拟人化参数，供 Ctrl+Shift+Alt+0 输入回答时使用。"""
+    global _typing_options
+    _typing_options = dict(options or {})
 
 
 def append_action(action: str, payload: dict | None = None) -> None:
@@ -86,6 +103,19 @@ def append_action(action: str, payload: dict | None = None) -> None:
 def set_extract_enabled(enabled: bool) -> None:
     global _extract_enabled
     _extract_enabled = bool(enabled)
+
+
+def set_analyze_extract(enabled: bool) -> None:
+    """快捷键分析是否固定经过题干抽离层（网页配置）。"""
+    global _analyze_extract
+    _analyze_extract = bool(enabled)
+
+
+def get_hotkeys() -> dict:
+    from webapp.settings import load_settings
+
+    s = load_settings()
+    return {**DEFAULT_HOTKEYS, **(s.get("hotkeys") or {})}
 
 
 def set_token(token: str) -> None:
@@ -219,7 +249,7 @@ def _run_analyze(extract: bool | None = None) -> None:
     global _messages, _extracted, _use_images
 
     if extract is None:
-        extract = _extract_enabled
+        extract = _analyze_extract
 
     with _state_lock:
         images = list(_images)
@@ -252,17 +282,33 @@ def _run_analyze(extract: bool | None = None) -> None:
     _set_status("完成（会话已清空，可按 Ctrl+Shift+L 把回答输入到 B）")
 
 
+_TYPING_NUMERIC_KEYS = (
+    "interval_min_ms", "interval_max_ms", "line_pause_min_ms", "line_pause_max_ms",
+    "space_interval_ms", "typo_rate", "typo_pause_min_ms", "typo_pause_max_ms",
+    "enter_via_paste", "indent_mode", "indent_style", "tab_size",
+    "clean_invisibles", "dismiss_delay_ms",
+)
+
+
 def _run_type_answer() -> None:
     with _state_lock:
         answer = _last_answer
+        opts = dict(_typing_options)
     if not answer.strip():
         _set_status("没有可输入的回答")
         return
+    numeric = {k: opts[k] for k in _TYPING_NUMERIC_KEYS if k in opts}
     request_type(
-        answer, 60, 3,
-        humanize=True, unicode_only=True, dismiss_suggest=True, paste_mode=False,
+        answer,
+        int(opts.get("interval_ms", 60)),
+        float(opts.get("start_delay_s", 3)),
+        bool(opts.get("humanize", True)),
+        bool(opts.get("unicode_only", True)),
+        bool(opts.get("dismiss_suggest", True)),
+        bool(opts.get("paste_mode", False)),
+        numeric,
     )
-    _set_status("已把最近回答发送到 B 逐字输入")
+    _set_status("已把最近回答发送到 B 输入")
 
 
 def _run_ask(text: str) -> None:
@@ -296,6 +342,7 @@ def _dispatch(action: str, payload: dict) -> None:
             bool(payload.get("unicode_only", False)),
             bool(payload.get("dismiss_suggest", True)),
             bool(payload.get("paste_mode", False)),
+            dict(payload.get("options") or {}),
         )
     else:
         _set_status(f"未知动作: {action}")
@@ -339,6 +386,12 @@ class _Handler(BaseHTTPRequestHandler):
         path, _, query = self.path.partition("?")
         if path == "/health":
             self._json(200, {"ok": True, "status": _status})
+            return
+        if path == "/hotkeys":
+            if not self._authorized():
+                self._json(401, {"error": "bad token"})
+                return
+            self._json(200, {"hotkeys": get_hotkeys()})
             return
         if path != "/pending":
             self._json(404, {"error": "not found"})

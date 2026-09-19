@@ -1,17 +1,26 @@
 {
-  "server_url": "http://192.168.1.137:8503",
-  "token": "admin",
+  "server_url": "http://192.168.1.50:8503",
+  "token": "改成和 S 端 B_API_TOKEN 一致",
   "monitor": 1,
   "jpeg_quality": 85,
   "scale": 1.0,
   "poll_wait": 25,
   "hotkeys_enabled": true,
+  "hotkeys": {},
+
   "interval_min_ms": 200,
   "interval_max_ms": 1000,
   "line_pause_min_ms": 1000,
   "line_pause_max_ms": 2000,
+  "space_interval_ms": 15,
   "typo_rate": 0.005,
   "typo_pause_min_ms": 100,
   "typo_pause_max_ms": 300,
-  "dismiss_suggest": true
+  "dismiss_suggest": true,
+  "dismiss_delay_ms": 80,
+  "enter_via_paste": false,
+  "indent_mode": "vscode",
+  "indent_style": "spaces",
+  "tab_size": 4,
+  "clean_invisibles": true
 }

@@ -12,6 +12,28 @@ DEFAULTS: dict = {
     "max_tokens": 1024,
     "b_api_token": "",
     "extract_prompt": "上述所有图片都是同一个题目的截图，请把它们的内容整理成规范、完整、可直接作答的题干。",
+    "type_interval_min_ms": 200,
+    "type_interval_max_ms": 1000,
+    "type_line_pause_min_ms": 1000,
+    "type_line_pause_max_ms": 2000,
+    "type_typo_rate_pct": 0.5,
+    "type_typo_pause_min_ms": 100,
+    "type_typo_pause_max_ms": 300,
+    "type_enter_via_paste": False,
+    "type_space_interval_ms": 15,
+    "type_indent_mode": "vscode",
+    "type_indent_style": "spaces",
+    "type_tab_size": 4,
+    "type_clean_invisibles": True,
+    "type_dismiss_delay_ms": 80,
+    "analyze_extract": True,
+    "hotkeys": {
+        "capture": "ctrl+shift+alt+8",
+        "analyze": "ctrl+shift+alt+9",
+        "type_answer": "ctrl+shift+alt+0",
+        "clear": "ctrl+shift+alt+minus",
+        "stop": "ctrl+shift+alt+plus",
+    },
 }
 
 

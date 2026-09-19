@@ -23,8 +23,18 @@ st.set_page_config(page_title="拍照问答", page_icon="📷", layout="wide")
 
 settings = load_settings()
 
+
+def persist(values: dict) -> None:
+    """把某一段参数合并进 settings.json（分区保存）。"""
+    merged = dict(settings)
+    merged.update(values)
+    save_settings(merged)
+
+
 with st.sidebar:
     st.header("⚙️ 设置")
+
+    st.subheader("🤖 LLM")
     base_url = st.text_input("Base URL", value=settings["base_url"])
     api_key = st.text_input("API Key", value=settings["api_key"], type="password")
     model = st.text_input("模型", value=settings["model"])
@@ -34,13 +44,21 @@ with st.sidebar:
         value=int(settings["max_tokens"]), step=64,
         help="单次回答的最大长度；回答被截断时调大。范围 64–32768。",
     )
+    if st.button("💾 保存 LLM 设置", use_container_width=True):
+        persist({
+            "base_url": base_url, "api_key": api_key, "model": model,
+            "prompt": prompt, "max_tokens": int(max_tokens),
+        })
+        st.success("已保存 LLM 设置。")
 
     st.divider()
     st.subheader("🧩 题干抽离层")
     extract_prompt = st.text_area(
         "抽离提示词（固定）", value=settings.get("extract_prompt", ""), height=80
     )
-    st.caption("勾选 Tab 里的「先做题干抽离」后会先用这段提示词把多张图整理成规范题干。")
+    if st.button("💾 保存抽离设置", use_container_width=True):
+        persist({"extract_prompt": extract_prompt})
+        st.success("已保存抽离设置。")
 
     st.divider()
     st.subheader("🖥️ B 通道")
@@ -48,24 +66,38 @@ with st.sidebar:
         "B_API_TOKEN", value=settings.get("b_api_token", ""), type="password"
     )
     st.caption("B 客户端需用相同 token 访问本机 8503 端口")
+    if st.button("💾 保存 B 通道", use_container_width=True):
+        persist({"b_api_token": b_api_token})
+        st.success("已保存 B 通道。")
 
-    if st.button("💾 保存设置", use_container_width=True):
-        save_settings({
-            "base_url": base_url,
-            "api_key": api_key,
-            "model": model,
-            "prompt": prompt,
-            "max_tokens": int(max_tokens),
-            "extract_prompt": extract_prompt,
-            "b_api_token": b_api_token,
+    st.divider()
+    st.subheader("⌨️ 快捷键与行为")
+    analyze_extract = st.checkbox(
+        "分析时固定经过题干抽离层", value=bool(settings.get("analyze_extract", True))
+    )
+    hk = settings.get("hotkeys") or {}
+    hk_capture = st.text_input("截屏", hk.get("capture", "ctrl+shift+alt+8"))
+    hk_analyze = st.text_input("分析", hk.get("analyze", "ctrl+shift+alt+9"))
+    hk_type = st.text_input("输入回答", hk.get("type_answer", "ctrl+shift+alt+0"))
+    hk_clear = st.text_input("清空", hk.get("clear", "ctrl+shift+alt+minus"))
+    hk_stop = st.text_input("停止输入", hk.get("stop", "ctrl+shift+alt+plus"))
+    st.caption("修饰键 ctrl/shift/alt；特殊键用 minus/plus/8/9/0/a-z。B 端会定期拉取并热注册。")
+    if st.button("💾 保存快捷键/行为", use_container_width=True):
+        persist({
+            "analyze_extract": bool(analyze_extract),
+            "hotkeys": {
+                "capture": hk_capture, "analyze": hk_analyze, "type_answer": hk_type,
+                "clear": hk_clear, "stop": hk_stop,
+            },
         })
-        st.success("已保存，下次打开自动读取。")
+        st.success("已保存快捷键/行为。")
 
     if not api_key:
         st.warning("尚未填写 API Key，无法调用模型。")
 
 capture_api.ensure_started(port=8503)
 capture_api.set_token(b_api_token or os.environ.get("B_API_TOKEN", ""))
+capture_api.set_analyze_extract(analyze_extract)
 
 
 def stitch_png(images: list[bytes]) -> bytes:
@@ -219,30 +251,116 @@ with tab_b:
 
 with tab_kb:
     st.caption("把文本逐字输入到 B 的当前焦点窗口（中文用 SendInput Unicode，不占用剪贴板）。")
+
     st.text_area("要输入到 B 的文本", key="type_text", height=160)
 
-    humanize = st.checkbox(
-        "拟人化输入：字符间隔 200–1000ms 随机 + 换行后停顿 1000–2000ms + 0.5% 错字纠正",
-        value=True,
+    indent_labels = {
+        "vscode-python（模型预测，推荐）": "vscode",
+        "target-indent（兜底：强制到目标缩进）": "target",
+        "不处理（原样逐字）": "none",
+    }
+    saved_mode = settings.get("type_indent_mode", "vscode")
+    default_label = next((k for k, v in indent_labels.items() if v == saved_mode),
+                         "vscode-python（模型预测，推荐）")
+    indent_mode = indent_labels[st.selectbox(
+        "缩进策略", list(indent_labels), index=list(indent_labels).index(default_label)
+    )]
+
+    g1, g2, g3 = st.columns(3)
+    indent_style = g1.selectbox(
+        "缩进字符", ["spaces", "tabs"],
+        index=0 if settings.get("type_indent_style", "spaces") == "spaces" else 1,
     )
+    tab_size = g2.number_input("tab 宽度", 1, 8, int(settings.get("type_tab_size", 4)))
+    space_interval = g3.number_input(
+        "空格/缩进间隔(ms)", 0, 200, int(settings.get("type_space_interval_ms", 15)), 1,
+        help="空格与缩进使用这个高速间隔，与普通字符的速率分开。",
+    )
+
+    humanize = st.checkbox("拟人化输入：随机间隔 + 换行停顿 + 偶发错字纠正", value=True)
     unicode_only = st.checkbox(
         "纯 Unicode 输出：跳过非 Unicode 字符（emoji、代理区等）", value=False
     )
     paste_mode = st.checkbox(
-        "整段粘贴模式：一次性粘贴，绕过 IDE 自动补全/自动配对（会覆盖 B 的剪贴板）",
-        value=False,
+        "整段粘贴模式：一次性粘贴，绕过补全/自动配对（会覆盖 B 的剪贴板）", value=False
     )
     dismiss_suggest = st.checkbox(
         "IDE 兼容：回车/制表前先按 Esc 关掉自动补全弹窗", value=True, disabled=paste_mode
     )
+    clean_invisibles = st.checkbox(
+        "清理不可见/智能字符（NBSP、全角空格、零宽、智能引号）",
+        value=bool(settings.get("type_clean_invisibles", True)),
+    )
+    enter_via_paste = st.checkbox(
+        "换行用粘贴插入（仅“不处理”模式）",
+        value=bool(settings.get("type_enter_via_paste", False)), disabled=paste_mode,
+    )
+
+    with st.expander("⚙️ 高级：拟人化参数（可调，Ctrl+Shift+Alt+0 也使用）"):
+        a1, a2 = st.columns(2)
+        t_imin = a1.number_input("字符间隔最小(ms)", 0, 10000,
+                                 int(settings.get("type_interval_min_ms", 200)), 10)
+        t_imax = a2.number_input("字符间隔最大(ms)", 0, 10000,
+                                 int(settings.get("type_interval_max_ms", 1000)), 10)
+        b1, b2 = st.columns(2)
+        t_lpmin = b1.number_input("换行停顿最小(ms)", 0, 60000,
+                                  int(settings.get("type_line_pause_min_ms", 1000)), 50)
+        t_lpmax = b2.number_input("换行停顿最大(ms)", 0, 60000,
+                                  int(settings.get("type_line_pause_max_ms", 2000)), 50)
+        e1, e2, e3 = st.columns(3)
+        t_typo = e1.number_input("错字概率(%)", 0.0, 20.0,
+                                 float(settings.get("type_typo_rate_pct", 0.5)), 0.1)
+        t_tpmin = e2.number_input("错字停顿最小(ms)", 0, 5000,
+                                  int(settings.get("type_typo_pause_min_ms", 100)), 10)
+        t_tpmax = e3.number_input("错字停顿最大(ms)", 0, 5000,
+                                  int(settings.get("type_typo_pause_max_ms", 300)), 10)
+        t_dd = st.number_input("Esc 后等待(ms)", 0, 1000,
+                               int(settings.get("type_dismiss_delay_ms", 80)), 5)
+
+    numeric_options = {
+        "interval_min_ms": int(t_imin),
+        "interval_max_ms": int(t_imax),
+        "line_pause_min_ms": int(t_lpmin),
+        "line_pause_max_ms": int(t_lpmax),
+        "space_interval_ms": int(space_interval),
+        "typo_rate": float(t_typo) / 100.0,
+        "typo_pause_min_ms": int(t_tpmin),
+        "typo_pause_max_ms": int(t_tpmax),
+        "enter_via_paste": bool(enter_via_paste),
+        "indent_mode": indent_mode,
+        "indent_style": indent_style,
+        "tab_size": int(tab_size),
+        "clean_invisibles": bool(clean_invisibles),
+        "dismiss_delay_ms": int(t_dd),
+    }
 
     k1, k2, k3 = st.columns([1, 1, 2])
     delay = k1.number_input("开始前延迟(s)", min_value=0, max_value=60, value=3)
     interval = k2.number_input(
-        "字符间隔(ms)", min_value=0, max_value=1000, value=60, step=10,
-        disabled=(humanize or paste_mode),
+        "固定字符间隔(ms)", min_value=0, max_value=10000, value=60, step=10,
+        disabled=(humanize or paste_mode), help="仅在关闭“拟人化输入”时使用。",
     )
     k3.button("⬆️ 用最近回答填充", on_click=fill_from_answer, use_container_width=True)
+
+    capture_api.set_typing_options({
+        **numeric_options, "humanize": humanize, "unicode_only": unicode_only,
+        "dismiss_suggest": dismiss_suggest, "paste_mode": paste_mode,
+        "interval_ms": int(interval), "start_delay_s": float(delay),
+    })
+
+    if st.button("💾 保存键盘参数"):
+        persist({
+            "type_interval_min_ms": int(t_imin), "type_interval_max_ms": int(t_imax),
+            "type_line_pause_min_ms": int(t_lpmin), "type_line_pause_max_ms": int(t_lpmax),
+            "type_space_interval_ms": int(space_interval),
+            "type_typo_rate_pct": float(t_typo),
+            "type_typo_pause_min_ms": int(t_tpmin), "type_typo_pause_max_ms": int(t_tpmax),
+            "type_enter_via_paste": bool(enter_via_paste),
+            "type_indent_mode": indent_mode, "type_indent_style": indent_style,
+            "type_tab_size": int(tab_size), "type_clean_invisibles": bool(clean_invisibles),
+            "type_dismiss_delay_ms": int(t_dd),
+        })
+        st.success("已保存键盘参数。")
 
     if st.button("⌨️ 输入到 B", type="primary"):
         text = (st.session_state.get("type_text") or "").strip()
@@ -253,6 +371,7 @@ with tab_kb:
                 text, int(interval), float(delay),
                 humanize=humanize, unicode_only=unicode_only,
                 dismiss_suggest=dismiss_suggest, paste_mode=paste_mode,
+                options=numeric_options,
             )
             st.success(
                 f"已发送：约 {int(delay)} 秒后开始输入（共 {len(text)} 字）。"
