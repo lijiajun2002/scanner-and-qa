@@ -23,9 +23,11 @@ import b_client.capture_agent as ca  # noqa: E402
 
 VK = {"_VK_RETURN": 0x0D, "_VK_TAB": 0x09, "_VK_BACK": 0x08, "_VK_ESCAPE": 0x1B,
       "_VK_SHIFT": 0x10, "_VK_HOME": 0x24, "_VK_END": 0x23, "_VK_DELETE": 0x2E,
-      "_VK_CONTROL": 0x11, "_VK_V": 0x56, "_VK_L": 0x4C, "_VK_C": 0x43}
+      "_VK_CONTROL": 0x11, "_VK_V": 0x56, "_VK_L": 0x4C, "_VK_C": 0x43,
+      "_VK_END": 0x23, "_VK_UP": 0x26, "_VK_DOWN": 0x28, "_VK_OEM_4": 0xDB}
 VK_RETURN, VK_TAB, VK_BACK, VK_ESCAPE = 0x0D, 0x09, 0x08, 0x1B
 VK_SHIFT, VK_HOME, VK_END, VK_DELETE = 0x10, 0x24, 0x23, 0x2E
+VK_CONTROL, VK_OEM_4, VK_UP, VK_DOWN = 0x11, 0xDB, 0x26, 0x28
 
 
 class VSCode:
@@ -41,6 +43,7 @@ class VSCode:
         self.auto_indent = auto_indent
         self.auto_close = auto_close
         self.shift = False
+        self.ctrl = False
         self.clipboard = ""
         self.paste_count = 0
 
@@ -103,6 +106,18 @@ class VSCode:
         self.pos = (self.pos[0], len(self.lines[self.pos[0]]))
         if not select:
             self.collapse()
+
+    def up(self):
+        if self.pos[0] > 0:
+            li = self.pos[0] - 1
+            self.pos = (li, min(self.pos[1], len(self.lines[li])))
+        self.collapse()
+
+    def down(self):
+        if self.pos[0] < len(self.lines) - 1:
+            li = self.pos[0] + 1
+            self.pos = (li, min(self.pos[1], len(self.lines[li])))
+        self.collapse()
 
     def enter(self):
         self._del_sel()
@@ -203,6 +218,26 @@ class VSCode:
         self._del_sel()
         self._insert(text)
 
+    def _shift_left(self, amount):
+        def sh(p):
+            li, ci = p
+            return (li, max(0, ci - amount))
+        self.pos = sh(self.pos)
+        self.anchor = sh(self.anchor)
+
+    def outdent(self):
+        """editor.action.outdentLines：去掉当前行一个缩进单位（ShiftCommand.unshiftIndent）。"""
+        li = self.pos[0]
+        line = self.lines[li]
+        n = 0
+        while n < len(line) and line[n] in " \t":
+            n += 1
+        if n == 0:
+            return
+        cut = 1 if line[0] == "\t" else min(n, self.tab_size)
+        self.lines[li] = line[cut:]
+        self._shift_left(cut)
+
     def feed(self, inp):
         tag, val, keyup = inp
         if tag == "uni":
@@ -212,7 +247,14 @@ class VSCode:
         if val == VK_SHIFT:
             self.shift = not keyup
             return
+        if val == VK_CONTROL:
+            self.ctrl = not keyup
+            return
         if keyup:
+            return
+        if self.ctrl:
+            if val == VK_OEM_4:
+                self.outdent()
             return
         if val == VK_RETURN:
             self.enter()
@@ -221,7 +263,14 @@ class VSCode:
         elif val == VK_END:
             self.end(select=self.shift)
         elif val == VK_TAB:
-            self.tab(select=self.shift)
+            if self.shift:
+                self.outdent()
+            else:
+                self.tab(select=self.shift)
+        elif val == VK_UP:
+            self.up()
+        elif val == VK_DOWN:
+            self.down()
         elif val == VK_BACK:
             self.backspace()
         elif val == VK_DELETE:
@@ -229,7 +278,7 @@ class VSCode:
         # ESC: no-op
 
 
-def run_injector(editor, code, **opts):
+def _install(editor):
     ca.os = types.SimpleNamespace(name="nt")
     for name, val in VK.items():
         setattr(ca, name, val)
@@ -238,14 +287,40 @@ def run_injector(editor, code, **opts):
     ca._send_inputs = lambda *inputs: [editor.feed(i) for i in inputs]
     ca._set_clipboard_text = lambda t: setattr(editor, "clipboard", t)
     ca._paste_shortcut = lambda: editor.paste(editor.clipboard)
+    ca._cursor_pos = lambda: None   # 非 Windows：鼠标守卫打桩
 
+
+def _base_opts(**opts):
     base = {"typo_rate": 0, "dismiss_delay_ms": 0, "space_interval_ms": 0,
             "humanize": False}
     base.update(opts)
-    typer = ca.SendInputTyper(base)
+    return base
+
+
+def run_injector(editor, code, **opts):
+    _install(editor)
+    typer = ca.SendInputTyper(_base_opts(**opts))
     import unittest.mock as mock
     with mock.patch("time.sleep", lambda *a, **k: None):
         typer.type_text(code, 0, 0, humanize=False, dismiss_suggest=False)
+    return typer
+
+
+def run_plan(editor, code, plan, **opts):
+    _install(editor)
+    typer = ca.SendInputTyper(_base_opts(**opts))
+    import unittest.mock as mock
+    with mock.patch("time.sleep", lambda *a, **k: None):
+        typer.type_plan(code, plan, 0, 0, humanize=False, dismiss_suggest=False)
+    return typer
+
+
+def run_keys(editor, code, keys, **opts):
+    _install(editor)
+    typer = ca.SendInputTyper(_base_opts(**opts))
+    import unittest.mock as mock
+    with mock.patch("time.sleep", lambda *a, **k: None):
+        typer.type_keys(keys, code, 0, 0, humanize=False, dismiss_suggest=False)
     return typer
 
 
@@ -318,6 +393,104 @@ def _check_doc(label, lines, pos, expected, indent_style="spaces",
     return ok
 
 
+def _check_plan(label, indent_style, auto_indent=True, auto_close=True):
+    style = indent_style
+    ed = VSCode(insert_spaces=(style == "spaces"), tab_size=4,
+                auto_indent=auto_indent, auto_close=auto_close)
+    # 明显乱序 + 停顿 + 回看
+    plan = {
+        "order": [1, 4, 2, 5, 3, 6, 7, 12, 8, 13, 9, 14, 10, 15, 11, 16],
+        "pauses": [{"after": 1, "ms": 300}, {"after": 8, "ms": 500}],
+        "revisit": [5, 10],
+    }
+    run_plan(ed, TRAP, plan, indent_style=style, tab_size=4)
+    expected = to_style(TRAP, style, 4)
+    ok = ed.text() == expected
+    print(f"[{'ok' if ok else 'FAIL'}] {label}")
+    if not ok:
+        got = ed.text().split("\n")
+        exp = expected.split("\n")
+        for i in range(max(len(got), len(exp))):
+            g = got[i] if i < len(got) else "<none>"
+            e = exp[i] if i < len(exp) else "<none>"
+            if g != e:
+                print(f"    line {i+1}: got {g!r} expected {e!r}")
+    return ok
+
+
+def _check_stop_resume(label):
+    code = "aa\nbb\ncc\ndd"
+    ed = VSCode(insert_spaces=True, tab_size=4)
+    _install(ed)
+    typer = ca.SendInputTyper(_base_opts(indent_style="spaces", tab_size=4))
+    import unittest.mock as mock
+
+    orig = typer._type_char
+    counter = {"n": 0}
+
+    def wrapped(ch, *a, **k):
+        r = orig(ch, *a, **k)
+        if r:
+            counter["n"] += 1
+            if counter["n"] == 3:       # 停在第 3 个字符（line3 的半行）
+                typer.stop("web")
+        return r
+
+    typer._type_char = wrapped
+    plan = {"order": [1, 3, 2, 4]}
+    with mock.patch("time.sleep", lambda *a, **k: None):
+        typer.type_plan(code, plan, 0, 0, humanize=False, dismiss_suggest=False)
+    stopped_ok = (typer.stopped and typer.stop_reason == "web"
+                  and 1 in typer.progress["done_lines"]
+                  and typer.progress["current_line"] == 3)
+    # 半行 line3 应被退格清空
+    partial_cleared = ed.lines[2] == ""
+    # 断点续传：对剩余行重新给一份计划
+    remaining = [i for i in range(1, 5) if i not in typer.progress["done_lines"]]
+    ed2 = ed  # 同一文档继续
+    with mock.patch("time.sleep", lambda *a, **k: None):
+        typer.type_plan(code, {"order": remaining}, 0, 0, humanize=False,
+                        dismiss_suggest=False, resume=True)
+    resumed_ok = ed2.text() == code
+    ok = stopped_ok and partial_cleared and resumed_ok
+    print(f"[{'ok' if ok else 'FAIL'}] {label} (stopped={stopped_ok} "
+          f"cleared={partial_cleared} resumed={resumed_ok})")
+    if not ok:
+        print("    progress:", typer.progress)
+        print("    text:", repr(ed2.text()))
+    return ok
+
+
+def _check_keystream(label, auto_indent=True, auto_close=True):
+    code = "def f(a):\n    b = a[0]\n    return b"
+    keys = ["def f(a):", "<Enter>", "b = a[0]", "<Enter>", "return b"]
+    ed = VSCode(insert_spaces=True, tab_size=4, auto_indent=auto_indent,
+                auto_close=auto_close)
+    run_keys(ed, code, keys, indent_style="spaces", tab_size=4)
+    ok = ed.text() == code
+    print(f"[{'ok' if ok else 'FAIL'}] {label}")
+    if not ok:
+        print("    got:", repr(ed.text()), "exp:", repr(code))
+    return ok
+
+
+def _check_keystream_bad(label):
+    """回放校验：keyboard 流与目标不一致时必须抛 ValueError（不会写坏）。"""
+    ed = VSCode(insert_spaces=True, tab_size=4)
+    _install(ed)
+    typer = ca.SendInputTyper(_base_opts(indent_style="spaces", tab_size=4))
+    import unittest.mock as mock
+    try:
+        with mock.patch("time.sleep", lambda *a, **k: None):
+            typer.type_keys(["nope"], "def f():", 0, 0, humanize=False,
+                            dismiss_suggest=False)
+    except ValueError:
+        print(f"[ok] {label}")
+        return True
+    print(f"[FAIL] {label}")
+    return False
+
+
 def main():
     results = []
     results.append(_check("spaces + autoIndent + autoClose", True, "spaces"))
@@ -331,6 +504,13 @@ def main():
     results.append(_check_doc("insert in middle (content below kept)",
                               ["x = 1", "", "y = 2"], (1, 0),
                               "x = 1\n" + TRAP + "\ny = 2"))
+    results.append(_check_plan("plan(order) spaces + autoIndent + autoClose", "spaces"))
+    results.append(_check_plan("plan(order) tabs + autoIndent + autoClose", "tabs"))
+    results.append(_check_plan("plan(order) spaces + no autoIndent", "spaces",
+                               auto_indent=False))
+    results.append(_check_stop_resume("stop -> cleanup -> resume"))
+    results.append(_check_keystream("keystream spaces + autoIndent + autoClose"))
+    results.append(_check_keystream_bad("keystream 校验失败 -> ValueError"))
     print("VSCODE SIM", "OK" if all(results) else "FAILED")
     return 0 if all(results) else 1
 

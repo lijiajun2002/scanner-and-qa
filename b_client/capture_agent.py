@@ -125,6 +125,10 @@ if os.name == "nt":
     _VK_SHIFT = 0x10
     _VK_HOME = 0x24
     _VK_END = 0x23
+    _VK_UP = 0x26
+    _VK_DOWN = 0x28
+    _VK_DELETE = 0x2E
+    _VK_OEM_4 = 0xDB  # '['；Ctrl+[ = editor.action.outdentLines（减少缩进）
     _CF_UNICODETEXT = 13
     _GMEM_MOVEABLE = 0x0002
 
@@ -184,6 +188,19 @@ if os.name == "nt":
             _vk_input(_VK_CONTROL, True),
         )
 
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(_POINT)]
+    _user32.GetCursorPos.restype = wintypes.BOOL
+
+    def _cursor_pos() -> tuple[int, int] | None:
+        """当前鼠标指针坐标（用于"鼠标一动就停"）。滚轮不改变坐标，天然不影响。"""
+        pt = _POINT()
+        if _user32.GetCursorPos(ctypes.byref(pt)):
+            return (pt.x, pt.y)
+        return None
+
 
 # 输入行为的默认参数（可在 config.json 覆盖）
 TYPING_DEFAULTS = {
@@ -202,9 +219,16 @@ TYPING_DEFAULTS = {
     "indent_style": "spaces",    # spaces / tabs
     "tab_size": 4,
     "clean_invisibles": True,    # 清理 NBSP/全角空格/零宽/智能引号
+    "mouse_stop_enabled": True,  # 逐字输入时鼠标移动超过阈值则自动停止
+    "mouse_stop_px": 10,         # 位移阈值（像素）；滚轮不改变指针坐标，不影响翻页
+    "keystream_autoindent": True,  # 键盘流校验时假定 VS Code 回车自动缩进（关掉则用 autoIndent:none）
 }
 
 _TYPO_POOL = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+# human 模式：回车后用 Ctrl+[ 连续减少缩进（行首为 0 时是 no-op），次数给足即可
+# 清到 0，覆盖括号对齐等较深缩进；多按不会删换行，安全。
+_OUTDENT_PRESSES = 24
 
 # ---- 文本预处理：归一化 / 拆行 / 缩进预测（纯函数，便于测试） ----
 _INVISIBLE_MAP = {0x00A0: " ", 0x3000: " "}
@@ -252,6 +276,122 @@ def build_indent(cols: int, style: str, tab_size: int) -> str:
     return " " * cols
 
 
+# ==================== 键盘流（LLM 直接给按键序列） ====================
+# 合法 token：普通文本 / <Enter> / <Tab> / <S-Tab> / <Up> / <Down>
+_KEY_TOKENS = ("<Enter>", "<Tab>", "<S-Tab>", "<Shift+Tab>", "<Up>", "<Down>")
+
+
+class _KeyMirror:
+    """模拟 VS Code：回车自动缩进、Tab/S-Tab、上下移动、括号自动配对。
+
+    仅用于「执行前校验」和「记录进度」，不参与真实按键发送。
+    """
+
+    def __init__(self, tab_size: int = 4, insert_spaces: bool = True,
+                 auto_indent: bool = True) -> None:
+        self.lines = [""]
+        self.li = 0
+        self.ci = 0
+        self.tab_size = max(1, int(tab_size))
+        self.insert_spaces = insert_spaces
+        self.auto_indent = auto_indent
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def _unit(self) -> str:
+        return " " * self.tab_size if self.insert_spaces else "\t"
+
+    def _type_char(self, ch: str) -> None:
+        line = self.lines[self.li]
+        if ch in ")]}'\"`" and self.ci < len(line) and line[self.ci] == ch:
+            self.ci += 1
+            return
+        pairs = {"(": ")", "[": "]", "{": "}", "'": "'", '"': '"'}
+        if ch in pairs:
+            nxt = line[self.ci] if self.ci < len(line) else ""
+            if not (ch in "([{" and nxt and (nxt.isalnum() or nxt == "_")):
+                self.lines[self.li] = line[:self.ci] + ch + pairs[ch] + line[self.ci:]
+                self.ci += 1
+                return
+        self.lines[self.li] = line[:self.ci] + ch + line[self.ci:]
+        self.ci += 1
+
+    def type(self, s: str) -> None:
+        for ch in s:
+            self._type_char(ch)
+
+    def enter(self) -> None:
+        line = self.lines[self.li]
+        left, right = line[:self.ci], line[self.ci:]
+        if self.auto_indent:
+            base = left[:len(left) - len(left.lstrip(" \t"))]
+            ind = base + self._unit() if left.rstrip().endswith(":") else base
+        else:
+            ind = ""
+        self.lines[self.li] = left
+        self.lines.insert(self.li + 1, ind + right)
+        self.li += 1
+        self.ci = len(ind)
+
+    def tab(self) -> None:
+        self.type(self._unit())
+
+    def shift_tab(self) -> None:
+        line = self.lines[self.li]
+        n = 0
+        while n < len(line) and line[n] in " \t":
+            n += 1
+        if not n:
+            return
+        cut = 1 if line[0] == "\t" else min(n, self.tab_size)
+        self.lines[self.li] = line[cut:]
+        self.ci = max(0, self.ci - cut)
+
+    def up(self) -> None:
+        if self.li > 0:
+            self.li -= 1
+            self.ci = min(self.ci, len(self.lines[self.li]))
+
+    def down(self) -> None:
+        if self.li < len(self.lines) - 1:
+            self.li += 1
+            self.ci = min(self.ci, len(self.lines[self.li]))
+
+    def apply(self, token: str) -> None:
+        if token == "<Enter>":
+            self.enter()
+        elif token == "<Tab>":
+            self.tab()
+        elif token in ("<S-Tab>", "<Shift+Tab>"):
+            self.shift_tab()
+        elif token == "<Up>":
+            self.up()
+        elif token == "<Down>":
+            self.down()
+        elif isinstance(token, str):
+            self.type(token)
+
+
+def simulate_keys(keys, tab_size: int = 4, insert_spaces: bool = True,
+                  auto_indent: bool = True) -> str:
+    mirror = _KeyMirror(tab_size, insert_spaces, auto_indent)
+    for token in keys:
+        if isinstance(token, str):
+            mirror.apply(token)
+    return mirror.text()
+
+
+def keys_valid(keys, target: str, tab_size: int = 4, insert_spaces: bool = True,
+               auto_indent: bool = True) -> bool:
+    if not isinstance(keys, list) or not keys:
+        return False
+    if any(not isinstance(t, str) for t in keys):
+        return False
+    got = simulate_keys(keys, tab_size, insert_spaces, auto_indent)
+    return got.rstrip("\n") == normalize_code_text(target).rstrip("\n")
+
+
 class SendInputTyper:
     """用 Windows SendInput 逐字注入文本，可选拟人化节奏与纯 Unicode 过滤。"""
 
@@ -265,6 +405,10 @@ class SendInputTyper:
         self.stopped = False
         self.log = None
         self._stop = threading.Event()
+        self.stop_reason: str | None = None
+        # 断点状态（保存在 B 端）：已写完的行 + 当前所在代码块行
+        self.progress: dict = {"done_lines": [], "current_line": 0, "total_lines": 0}
+        self._mouse_baseline: tuple[int, int] | None = None
 
     def set_options(self, overrides: dict | None) -> None:
         """按任务覆盖拟人化参数（min>max 时自动交换）。"""
@@ -276,10 +420,43 @@ class SendInputTyper:
                        ("typo_pause_min_ms", "typo_pause_max_ms")):
             if self.options[lo] > self.options[hi]:
                 self.options[lo], self.options[hi] = self.options[hi], self.options[lo]
-    def stop(self) -> None:
-        """请求停止当前输入（供停止热键调用）。"""
+
+    def stop(self, reason: str = "stop") -> None:
+        """请求停止当前输入（鼠标移动 / 网页停止按钮）。reason: mouse / web / stop。"""
+        if not self._stop.is_set():
+            self.stop_reason = reason
         self._stop.set()
         self.stopped = True
+
+    def clear_breakpoint(self) -> None:
+        """清掉断点（新会话/完整重新输出时调用）。"""
+        self.progress = {"done_lines": [], "current_line": 0, "total_lines": 0}
+
+    def reset_breakpoint(self) -> None:
+        self.clear_breakpoint()
+
+    # ---- 可中断 sleep：长停顿也要能被停止打断 ----
+    def _sleep(self, ms: float) -> None:
+        remaining = float(ms) / 1000.0
+        while remaining > 0 and not self._stop.is_set():
+            chunk = min(0.05, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    # ---- 鼠标守卫：仅在逐字输入时检测；滚轮不影响 ----
+    def _arm_mouse_guard(self) -> None:
+        self._mouse_baseline = _cursor_pos() if self.options.get("mouse_stop_enabled") else None
+
+    def _mouse_moved(self) -> bool:
+        if self._mouse_baseline is None:
+            return False
+        pos = _cursor_pos()
+        if pos is None:
+            return False
+        dx = pos[0] - self._mouse_baseline[0]
+        dy = pos[1] - self._mouse_baseline[1]
+        return (dx * dx + dy * dy) ** 0.5 > float(self.options.get("mouse_stop_px", 10))
+
 
     @staticmethod
     def _sendable_unicode(ch: str) -> bool:
@@ -293,43 +470,49 @@ class SendInputTyper:
 
     def _normal_interval(self, humanize: bool, fixed_ms: int) -> None:
         if humanize:
-            time.sleep(random.uniform(self.options["interval_min_ms"],
-                                      self.options["interval_max_ms"]) / 1000.0)
+            self._sleep(random.uniform(self.options["interval_min_ms"],
+                                       self.options["interval_max_ms"]))
         elif fixed_ms:
-            time.sleep(fixed_ms / 1000.0)
+            self._sleep(fixed_ms)
 
     def _space_interval(self) -> None:
-        time.sleep(self.options["space_interval_ms"] / 1000.0)
+        self._sleep(self.options["space_interval_ms"])
 
-    def _select_line_content(self, dismiss: bool = False) -> None:
-        """选中当前行内容（保留选区，不含换行）。
+    def _ctrl_key(self, vk: int) -> None:
+        _send_inputs(
+            _vk_input(_VK_CONTROL, False),
+            _vk_input(vk, False),
+            _vk_input(vk, True),
+            _vk_input(_VK_CONTROL, True),
+        )
 
-        两次 Home 确保到绝对行首（应对 VS Code 的智能 Home / 自动缩进），
-        再 Shift+End 选中整行内容。此时该行只含自动缩进空白，随后直接输入
-        目标缩进即可替换选区；不依赖剪贴板，也不会删除换行或合并下一行。
+    def _clear_line_indent(self, dismiss: bool = False) -> None:
+        """把当前行缩进清到 0，全程不产生选区（避免行首变蓝）。
+
+        用 Ctrl+[（editor.action.outdentLines）连续减小缩进；行首本就为 0 时是
+        no-op，所以多按几次安全（不会像 Delete 那样删掉换行）。最后 Home 确保
+        光标落在第 1 列，随后直接输入目标缩进即可。
         """
         if dismiss:
             _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
-            time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
+            self._sleep(self.options["dismiss_delay_ms"])
+        for _ in range(_OUTDENT_PRESSES):
+            self._ctrl_key(_VK_OEM_4)
         _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
-        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
-        _send_inputs(
-            _vk_input(_VK_SHIFT, False),
-            _vk_input(_VK_END, False),
-            _vk_input(_VK_END, True),
-            _vk_input(_VK_SHIFT, True),
-        )
 
     def _tap(self, vk: int, dismiss_suggest: bool = False) -> None:
         # IDE 里回车/制表会被当成"接受补全"，先按 Esc 关掉补全弹窗
         if dismiss_suggest:
             _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
-            time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
+            self._sleep(self.options["dismiss_delay_ms"])
         _send_inputs(_vk_input(vk, False), _vk_input(vk, True))
 
     def _type_char(self, ch: str, humanize: bool, interval_ms: int,
                    unicode_only: bool, dismiss: bool) -> bool:
         """输入一个字符：空格/制表走高速通道；返回 False 表示被跳过。"""
+        if self._mouse_moved():
+            self.stop("mouse")
+            return False
         if ch == " ":
             self._unicode_char(" ")
             self._space_interval()
@@ -343,51 +526,54 @@ class SendInputTyper:
             return False
         if humanize and random.random() < self.options["typo_rate"]:
             self._unicode_char(random.choice(_TYPO_POOL))
-            time.sleep(random.uniform(self.options["typo_pause_min_ms"],
-                                      self.options["typo_pause_max_ms"]) / 1000.0)
+            self._sleep(random.uniform(self.options["typo_pause_min_ms"],
+                                       self.options["typo_pause_max_ms"]))
             _send_inputs(_vk_input(_VK_BACK, False), _vk_input(_VK_BACK, True))
         self._unicode_char(ch)
         self._normal_interval(humanize, interval_ms)
         return True
 
-    def _type_indent_cols(self, cols: int, dismiss: bool) -> None:
-        """输入 cols 列缩进（调用前通常已选中整行空白，输入会替换选区）。
+    def _type_indent_cols(self, cols: int, dismiss: bool) -> int:
+        """输入 cols 列缩进（调用前已把当前行缩进清 0、光标在第 1 列，无选区）。
 
-        spaces：逐字输入空格，保留拟人节奏。
+        spaces：逐字输入空格，保留拟人节奏，无选区无闪烁。
         tabs：VS Code 的 Tab 键在选中整行时是“缩进整行”、空行时会跳到语言推导
-              缩进，无法精确到目标列；因此把缩进串粘贴覆盖选区，Tab 字符 100% 保真。
+              缩进，无法精确到目标列；因此把缩进串粘贴进来，Tab 字符 100% 保真。
+        返回实际输入的逻辑字符数（供断点清理用）。
         """
         if cols <= 0:
-            return
+            return 0
         tab_size = max(1, int(self.options["tab_size"]))
         if self.options["indent_style"] == "tabs":
             # 真机验证：粘贴后必须给 VS Code 足够时间处理（30ms 会被随后键入的正文
             # 抢先，导致缩进丢失）。0.12s + 0.25s 实测稳定。
-            _set_clipboard_text(build_indent(cols, "tabs", tab_size))
-            time.sleep(0.12)
+            indent = build_indent(cols, "tabs", tab_size)
+            _set_clipboard_text(indent)
+            self._sleep(120)
             _paste_shortcut()
-            time.sleep(0.25)
-            return
+            self._sleep(250)
+            return len(indent)
         for ch in build_indent(cols, "spaces", tab_size):
             self._unicode_char(ch)
             self._space_interval()
+        return cols
 
     def _press_enter(self, humanize: bool, interval_ms: int, dismiss: bool,
                      enter_via_paste: bool) -> None:
         if enter_via_paste:
             if dismiss:
                 _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
-                time.sleep(self.options["dismiss_delay_ms"] / 1000.0)
+                self._sleep(self.options["dismiss_delay_ms"])
             _set_clipboard_text("\n")
-            time.sleep(0.02)
+            self._sleep(20)
             _paste_shortcut()
         else:
             self._tap(_VK_RETURN, dismiss)
         if humanize:
-            time.sleep(random.uniform(self.options["line_pause_min_ms"],
-                                      self.options["line_pause_max_ms"]) / 1000.0)
+            self._sleep(random.uniform(self.options["line_pause_min_ms"],
+                                       self.options["line_pause_max_ms"]))
         elif interval_ms:
-            time.sleep(interval_ms / 1000.0)
+            self._sleep(interval_ms)
 
     def type_text(self, text: str, interval_ms: int, start_delay_s: float,
                   humanize: bool = True, unicode_only: bool = False,
@@ -403,19 +589,20 @@ class SendInputTyper:
             raise RuntimeError("SendInput 逐字输入仅支持 Windows")
 
         if start_delay_s > 0:
-            time.sleep(start_delay_s)
+            self._sleep(start_delay_s * 1000.0)
 
         self.skipped = 0
         self.typed = 0
         self.stopped = False
         self._stop.clear()
+        self.clear_breakpoint()   # 完整重新输出：丢弃旧断点
 
         if paste_mode:
             if self._stop.is_set():
                 self.stopped = True
                 return 0
             _set_clipboard_text(text)
-            time.sleep(0.05)
+            self._sleep(50)
             _paste_shortcut()
             self.typed = len(text)
             return 0
@@ -432,6 +619,7 @@ class SendInputTyper:
 
     def _type_plain(self, text: str, interval_ms: int, humanize: bool,
                     unicode_only: bool, dismiss: bool) -> None:
+        self._arm_mouse_guard()
         for ch in text:
             if self._stop.is_set():
                 self.stopped = True
@@ -453,28 +641,337 @@ class SendInputTyper:
         """
         tab_size = int(self.options["tab_size"])
         lines = split_code_lines(text, tab_size)
+        done: set[int] = set()
+        total = len(lines)
 
         for index, (cols, body) in enumerate(lines):
             if self._stop.is_set():
                 self.stopped = True
                 break
+            line_no = index + 1
+            self.progress = {"done_lines": sorted(done), "current_line": line_no,
+                             "total_lines": total}
 
             if index == 0:
-                self._type_indent_cols(cols, dismiss)
+                typed = self._type_indent_cols(cols, dismiss)
             else:
                 # 代码模式一律用真实回车，避免剪贴板竞态与不触发自动缩进的问题
                 self._press_enter(humanize, int(interval_ms), dismiss, False)
-                self._select_line_content(dismiss)
-                self._type_indent_cols(cols, dismiss)
+                # 不选中整行（会变蓝），改用 Ctrl+[ 清掉自动缩进再输入目标缩进
+                self._clear_line_indent(dismiss)
+                typed = self._type_indent_cols(cols, dismiss)
 
+            self._arm_mouse_guard()
             for ch in body:
                 if self._stop.is_set():
                     self.stopped = True
                     break
                 if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
+                    typed += 1
                     self.typed += 1
             if self.stopped:
+                if typed > 0:
+                    self._clear_current_line()  # 安全清掉当前半行
+                self.progress = {"done_lines": sorted(done), "current_line": line_no,
+                                 "total_lines": total}
                 break
+            done.add(line_no)
+
+    # ==================== 第三阶段：按 LLM 给的"人类写作顺序"输入 ====================
+    @staticmethod
+    def _parse_plan(plan, n: int, subset: bool = False):
+        """校验并归一化 plan，返回 (order, pauses, revisits)；非法返回 None。
+
+        subset=True 时 order 只要求是 1..n 的一个子集（断点续传只用剩余行）。
+        """
+        if not isinstance(plan, dict):
+            return None
+        raw = plan.get("order")
+        if not isinstance(raw, list):
+            return None
+        try:
+            order = [int(x) for x in raw]
+        except (TypeError, ValueError):
+            return None
+        if subset:
+            if not order or len(set(order)) != len(order) or any(not (1 <= x <= n) for x in order):
+                return None
+        elif sorted(order) != list(range(1, n + 1)):
+            return None
+        pauses: dict[int, float] = {}
+        for item in plan.get("pauses") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                after = int(item.get("after"))
+                ms = float(item.get("ms"))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= after <= n and ms > 0:
+                pauses[after] = min(ms, 180000.0)  # 允许"思考"长停顿（上限 3 分钟）
+        revisits: list[int] = []
+        for item in plan.get("revisit") or []:
+            try:
+                line_no = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= line_no <= n and line_no not in revisits:
+                revisits.append(line_no)
+        return order, pauses, revisits[:3]
+
+    def _move_to_block_line(self, cur: int, target: int, dismiss: bool) -> int:
+        """在已建好的代码块内横向/纵向移动到第 target 行的行首。"""
+        if dismiss:
+            _send_inputs(_vk_input(_VK_ESCAPE, False), _vk_input(_VK_ESCAPE, True))
+            self._sleep(self.options["dismiss_delay_ms"])
+        delta = target - cur
+        if delta:
+            vk = _VK_DOWN if delta > 0 else _VK_UP
+            for _ in range(abs(delta)):
+                _send_inputs(_vk_input(vk, False), _vk_input(vk, True))
+        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
+        return target
+
+    def _backspace(self, n: int) -> None:
+        for _ in range(max(0, int(n))):
+            _send_inputs(_vk_input(_VK_BACK, False), _vk_input(_VK_BACK, True))
+
+    def _clear_current_line(self) -> None:
+        """清空当前行内容（不含换行）：Home → Shift+End 选中 → Delete。
+
+        不用"退格 N 次"：自动补全/自动配对的 overtype 会让逻辑字数≠实际字数，
+        多退格会吃掉上一行。选中删除不依赖计数，且不会碰换行，最安全。
+        """
+        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
+        _send_inputs(_vk_input(_VK_HOME, False), _vk_input(_VK_HOME, True))
+        _send_inputs(
+            _vk_input(_VK_SHIFT, False),
+            _vk_input(_VK_END, False),
+            _vk_input(_VK_END, True),
+            _vk_input(_VK_SHIFT, True),
+        )
+        _send_inputs(_vk_input(_VK_DELETE, False), _vk_input(_VK_DELETE, True))
+
+    def _type_line_text(self, line: str, interval_ms: int, humanize: bool,
+                        unicode_only: bool, dismiss: bool) -> int:
+        """逐字输入一整行；被停止时把已输入的这一行(半行)退格清掉。
+
+        返回该行实际输入的逻辑字符数（用于断点/清理）。
+        """
+        self._arm_mouse_guard()  # 每行逐字开始前重置鼠标基线
+        i = 0
+        while i < len(line) and line[i] in (" ", "\t"):
+            i += 1
+        indent, body = line[:i], line[i:]
+        typed = 0
+        if indent:
+            # 缩进整段粘贴：瞬间到位（像按了 Tab），避免"从行首逐个空格挪过去"的观感；
+            # 也避开 VS Code 对 Tab 键的智能处理。空白内容不会被自动缩进重排。
+            _set_clipboard_text(indent)
+            self._sleep(100)
+            _paste_shortcut()
+            self._sleep(150)
+            typed += len(indent)
+        for ch in body:
+            if self._stop.is_set():
+                break
+            if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
+                typed += 1
+                self.typed += 1
+        if self._stop.is_set():
+            if typed > 0:
+                self._clear_current_line()   # 安全清掉当前半行（不依赖字数、不碰上一行）
+            return -typed
+        return typed
+
+    def _revisit_line(self, unicode_only: bool, dismiss: bool) -> None:
+        """回到行尾，敲几个字再退掉：看起来像回头检查/修改，但不改变内容。"""
+        _send_inputs(_vk_input(_VK_END, False), _vk_input(_VK_END, True))
+        n = random.randint(1, 3)
+        for _ in range(n):
+            self._unicode_char(random.choice(_TYPO_POOL))
+            self._sleep(random.uniform(50, 150))
+        self._sleep(random.uniform(200, 500))
+        self._backspace(n)
+
+    def type_plan(self, text: str, plan, interval_ms: int = 0,
+                  start_delay_s: float = 0.0, humanize: bool = True,
+                  unicode_only: bool = False,
+                  dismiss_suggest: bool | None = None, resume: bool = False) -> int:
+        """按 plan 的行序逐行输入 text（内容取自 text，顺序/停顿来自 plan）。
+
+        - 全新输出(resume=False)：按回车准备 N 行空行，再按 plan["order"] 逐行填入。
+        - 断点续传(resume=True)：不再建行，直接在已有文档里写 plan["order"] 指定的
+          剩余行（order 为其子集）；当前光标所在行由 self.progress["current_line"] 给出。
+        被停止时记录断点（已写完的行 + 当前行号），并把半行退格清掉。
+        order 非法时抛 ValueError（调用方回退到逐字 human 模式）。
+        """
+        if os.name != "nt":
+            raise RuntimeError("SendInput 逐字输入仅支持 Windows")
+        tab_size = max(1, int(self.options["tab_size"]))
+        style = self.options["indent_style"]
+        normalized = normalize_code_text(text, bool(self.options["clean_invisibles"]))
+        lines = [build_indent(cols, style, tab_size) + body
+                 for cols, body in split_code_lines(normalized, tab_size)]
+        n = len(lines)
+        if n == 0:
+            return 0
+        parsed = self._parse_plan(plan, n, subset=resume)
+        if parsed is None:
+            raise ValueError("plan.order 不是合法的行序")
+        order, pauses, revisits = parsed
+
+        if start_delay_s > 0:
+            self._sleep(start_delay_s * 1000.0)
+        self.skipped = 0
+        self.typed = 0
+        self.stopped = False
+        self._stop.clear()
+        if not resume:
+            self.clear_breakpoint()
+        done = set(self.progress.get("done_lines") or []) if resume else set()
+
+        dismiss = self.options["dismiss_suggest"] if dismiss_suggest is None else dismiss_suggest
+        typo_saved = self.options.get("typo_rate", 0.0)
+        self.options["typo_rate"] = 0.0  # 计划模式不主动打错，保证内容 100% 正确
+        try:
+            if resume:
+                # 键盘流中断后续传：文档可能还没有 N 行，先补足空白行（清掉自动缩进）
+                if self.progress.get("mode") == "keys":
+                    need = int(self.progress.get("total_lines") or 0) - int(
+                        self.progress.get("current_line") or 0)
+                    self._ensure_blank_lines(need, dismiss)
+                # 续传：以计划 order 为准定位；仅当进度里的当前行确实在 order 中时才用它
+                cur = int(self.progress.get("current_line") or 0)
+                if cur not in order:
+                    cur = order[0] if order else 1
+            else:
+                self._tap(_VK_HOME, False)
+                for _ in range(n - 1):
+                    if self._stop.is_set():
+                        self.stopped = True
+                        self.progress = {"done_lines": sorted(done),
+                                         "current_line": 0, "total_lines": n}
+                        return self.skipped
+                    self._tap(_VK_RETURN, dismiss)
+                cur = n
+            for line_no in order:
+                if self._stop.is_set():
+                    self.stopped = True
+                    break
+                cur = self._move_to_block_line(cur, line_no, dismiss)
+                self.progress = {"done_lines": sorted(done),
+                                 "current_line": line_no, "total_lines": n}
+                self._type_line_text(lines[line_no - 1], int(interval_ms),
+                                     humanize, unicode_only, dismiss)
+                if self._stop.is_set():
+                    self.stopped = True
+                    self.progress = {"done_lines": sorted(done),
+                                     "current_line": line_no, "total_lines": n}
+                    return self.skipped
+                done.add(line_no)
+                if line_no in pauses:
+                    self._sleep(pauses[line_no])
+            for line_no in revisits:
+                if self._stop.is_set():
+                    self.stopped = True
+                    break
+                cur = self._move_to_block_line(cur, line_no, dismiss)
+                self._revisit_line(unicode_only, dismiss)
+            self.progress = {"done_lines": sorted(done),
+                             "current_line": cur, "total_lines": n}
+        finally:
+            self.options["typo_rate"] = typo_saved
+        return self.skipped
+
+    def _ensure_blank_lines(self, need: int, dismiss: bool) -> None:
+        """在文末补 need 个空白行（补充回车后清掉自动缩进），供键盘流续传使用。"""
+        if need <= 0:
+            return
+        self._ctrl_key(_VK_END)
+        for _ in range(need):
+            self._tap(_VK_RETURN, False)
+            self._clear_line_indent(dismiss)   # 安全：把该行缩进清到 0（不删换行）
+
+    def _shift_tab(self) -> None:
+        _send_inputs(
+            _vk_input(_VK_SHIFT, False),
+            _vk_input(_VK_TAB, False),
+            _vk_input(_VK_TAB, True),
+            _vk_input(_VK_SHIFT, True),
+        )
+
+    def type_keys(self, keys, target: str, interval_ms: int = 0,
+                  start_delay_s: float = 0.0, humanize: bool = True,
+                  unicode_only: bool = False,
+                  dismiss_suggest: bool | None = None) -> int:
+        """执行 LLM 给的"键盘流"按键序列（Enter/Tab/S-Tab/Up/Down/文本）。
+
+        执行前用 _KeyMirror 回放校验：simulate_keys(keys) 必须等于 target，
+        否则抛 ValueError（调用方回退到行序计划 / 逐字模式），保证绝不写错。
+        """
+        if os.name != "nt":
+            raise RuntimeError("SendInput 逐字输入仅支持 Windows")
+        tab_size = max(1, int(self.options["tab_size"]))
+        insert_spaces = self.options["indent_style"] != "tabs"
+        auto_indent = bool(self.options.get("keystream_autoindent", True))
+        if not keys_valid(keys, target, tab_size, insert_spaces, auto_indent):
+            raise ValueError("键盘流回放与目标不一致")
+        normalized = normalize_code_text(target)
+        total = normalized.rstrip("\n").count("\n") + 1
+
+        if start_delay_s > 0:
+            self._sleep(start_delay_s * 1000.0)
+        self.skipped = 0
+        self.typed = 0
+        self.stopped = False
+        self._stop.clear()
+        self.clear_breakpoint()
+
+        dismiss = self.options["dismiss_suggest"] if dismiss_suggest is None else dismiss_suggest
+        typo_saved = self.options.get("typo_rate", 0.0)
+        self.options["typo_rate"] = 0.0  # 保证内容 100% 正确
+        mirror = _KeyMirror(tab_size, insert_spaces, auto_indent)
+        self._arm_mouse_guard()
+        try:
+            for token in keys:
+                if self._stop.is_set():
+                    self.stopped = True
+                    break
+                if token == "<Enter>":
+                    self._tap(_VK_RETURN, dismiss)
+                elif token == "<Tab>":
+                    self._tap(_VK_TAB, dismiss)
+                elif token in ("<S-Tab>", "<Shift+Tab>"):
+                    self._shift_tab()
+                elif token == "<Up>":
+                    self._tap(_VK_UP, dismiss)
+                elif token == "<Down>":
+                    self._tap(_VK_DOWN, dismiss)
+                else:
+                    for ch in token:
+                        if self._stop.is_set():
+                            self.stopped = True
+                            break
+                        if self._type_char(ch, humanize, int(interval_ms),
+                                           unicode_only, dismiss):
+                            self.typed += 1
+                mirror.apply(token)
+                self.progress = {
+                    "done_lines": list(range(1, mirror.li + 1)),
+                    "current_line": mirror.li + 1,
+                    "total_lines": total,
+                    "mode": "keys",
+                }
+                if self.stopped:
+                    break
+        finally:
+            self.options["typo_rate"] = typo_saved
+        if self.stopped:
+            self._clear_current_line()   # 安全清掉当前半行
+        self.progress["done_lines"] = list(range(1, mirror.li + 1))
+        self.progress["current_line"] = mirror.li + 1
+        return self.skipped
 
     @staticmethod
     def _unicode_char(ch: str) -> None:
@@ -541,11 +1038,14 @@ def grab_jpeg(sct, monitor: int, scale: float, quality: int) -> bytes:
 
 def post_result(base: str, headers: dict, log: logging.Logger,
                 kind: str, ok: bool, chars: int = 0, skipped: int = 0,
-                error: str | None = None) -> None:
+                error: str | None = None, progress: dict | None = None) -> None:
+    body = {"kind": kind, "ok": ok, "chars": chars, "skipped": skipped, "error": error}
+    if progress is not None:
+        body["progress"] = progress
     try:
         requests.post(
             f"{base}/result",
-            json={"kind": kind, "ok": ok, "chars": chars, "skipped": skipped, "error": error},
+            json=body,
             headers=headers,
             timeout=10,
         )
@@ -571,7 +1071,7 @@ _DEFAULT_HOTKEYS = {
     "analyze": "ctrl+shift+alt+9",
     "type_answer": "ctrl+shift+alt+0",
     "clear": "ctrl+shift+alt+minus",
-    "stop": "ctrl+shift+alt+plus",
+    "resume": "ctrl+shift+alt+plus",
 }
 _MOD_CTRL = {"ctrl", "ctrl_l", "ctrl_r"}
 _MOD_SHIFT = {"shift", "shift_l", "shift_r"}
@@ -699,10 +1199,12 @@ class GlobalHotkeys:
             self.win = False
 
     def _trigger(self, action: str) -> None:
-        if action == "stop":
-            if self.typer is not None:
-                self.typer.stop()
-                self.log.info("停止热键：已请求停止键盘输出")
+        if action == "resume":
+            # 断点续传：把 B 端的断点进度一起告诉 S，由 S 重新生成剩余行的计划
+            progress = self.typer.progress if self.typer is not None else {}
+            post_action(self.base, self.headers, self.log, "resume",
+                        {"done_lines": list(progress.get("done_lines") or []),
+                         "total_lines": int(progress.get("total_lines") or 0)})
             return
         post_action(self.base, self.headers, self.log, action)
 
@@ -750,6 +1252,30 @@ def start_hotkeys(base: str, headers: dict, log: logging.Logger,
     return gh
 
 
+def start_control_loop(base: str, headers: dict, log: logging.Logger,
+                       typer: "SendInputTyper") -> None:
+    """后台长轮询 S 的 /control：网页"停止"按钮 → 立即停止 B 端键盘输出。
+
+    （打字时主循环在同步执行 type 任务、不会去 /pending，所以停止必须走这条独立通道。）
+    """
+    control_url = f"{base}/control?wait=25"
+
+    def loop() -> None:
+        while True:
+            try:
+                resp = requests.get(control_url, headers=headers, timeout=40)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("stop"):
+                    typer.stop("web")
+                    log.info("收到网页停止指令：已请求停止键盘输出")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("控制通道轮询失败: %s", exc)
+                time.sleep(2)
+
+    threading.Thread(target=loop, name="control-loop", daemon=True).start()
+
+
 def main() -> int:
     cfg = load_config()
     try:
@@ -768,6 +1294,7 @@ def main() -> int:
     if cfg.get("hotkeys_enabled", True):
         initial = fetch_hotkeys(base, headers, log) or cfg.get("hotkeys") or _DEFAULT_HOTKEYS
         start_hotkeys(base, headers, log, typer, initial)
+    start_control_loop(base, headers, log, typer)
 
     backoff = 1
     with _MSS() as sct:
@@ -782,6 +1309,7 @@ def main() -> int:
 
                 kind = job.get("type")
                 if kind == "capture":
+                    typer.clear_breakpoint()   # 截屏 = 新会话，丢弃旧断点
                     try:
                         jpeg = grab_jpeg(sct, int(cfg["monitor"]),
                                          float(cfg["scale"]), int(cfg["jpeg_quality"]))
@@ -794,22 +1322,68 @@ def main() -> int:
                         post_result(base, headers, log, "capture", False, error=str(exc))
                 elif kind == "type":
                     text = str(job.get("text", ""))
+                    plan = job.get("plan")
+                    keys = job.get("keys")
+                    resume = bool(job.get("resume"))
                     try:
                         typer.set_options(job.get("options"))
-                        skipped = typer.type_text(
-                            text,
-                            int(job.get("interval_ms", 60)),
-                            float(job.get("start_delay_s", 3)),
-                            bool(job.get("humanize", True)),
-                            bool(job.get("unicode_only", False)),
-                            bool(job.get("dismiss_suggest", True)),
-                            bool(job.get("paste_mode", False)),
-                        )
-                        note = "（已被停止热键中断）" if typer.stopped else ""
-                        log.info("已逐字输入 %d 字（跳过 %d）%s", typer.typed, skipped, note)
+                        skipped = None
+                        # 第三阶段（首选）：LLM 键盘流；执行前回放校验，失败则回退行序计划
+                        if (not resume and isinstance(keys, list) and keys):
+                            try:
+                                skipped = typer.type_keys(
+                                    keys, text,
+                                    int(job.get("interval_ms", 60)),
+                                    float(job.get("start_delay_s", 3)),
+                                    bool(job.get("humanize", True)),
+                                    bool(job.get("unicode_only", False)),
+                                    bool(job.get("dismiss_suggest", True)),
+                                )
+                                log.info("已按键盘流输入 %d 字", typer.typed)
+                            except ValueError as exc:
+                                log.warning("键盘流不可用（%s），回退行序计划", exc)
+                                skipped = None
+                        if skipped is None and isinstance(plan, dict) and plan.get("order"):
+                            try:
+                                skipped = typer.type_plan(
+                                    text, plan,
+                                    int(job.get("interval_ms", 60)),
+                                    float(job.get("start_delay_s", 3)),
+                                    bool(job.get("humanize", True)),
+                                    bool(job.get("unicode_only", False)),
+                                    bool(job.get("dismiss_suggest", True)),
+                                    resume=resume,
+                                )
+                                log.info("已按键盘序列输入 %d 字 (%s)",
+                                         typer.typed, "续传" if resume else "完整")
+                            except ValueError as exc:
+                                log.warning("键盘序列不可用（%s）", exc)
+                                if resume:
+                                    # 续传计划无效时**绝不能**回退成整段重打（会从头再来）
+                                    post_result(base, headers, log, "type", False,
+                                                error=f"resume plan invalid: {exc}",
+                                                progress=typer.progress)
+                                    continue
+                                log.warning("回退逐字输入")
+                                skipped = None
+                        if skipped is None and not resume:
+                            skipped = typer.type_text(
+                                text,
+                                int(job.get("interval_ms", 60)),
+                                float(job.get("start_delay_s", 3)),
+                                bool(job.get("humanize", True)),
+                                bool(job.get("unicode_only", False)),
+                                bool(job.get("dismiss_suggest", True)),
+                                bool(job.get("paste_mode", False)),
+                            )
+                            log.info("已逐字输入 %d 字（跳过 %d）", typer.typed, skipped)
                         post_result(base, headers, log, "type", True,
                                     chars=typer.typed, skipped=skipped,
-                                    error="stopped" if typer.stopped else None)
+                                    error=typer.stop_reason if typer.stopped else None,
+                                    progress=typer.progress)
+                        if typer.stopped:
+                            log.info("输入被中断，原因=%s，进度=%s",
+                                     typer.stop_reason, typer.progress)
                     except Exception as exc:  # noqa: BLE001
                         log.warning("输入失败: %s", exc)
                         post_result(base, headers, log, "type", False, error=str(exc))

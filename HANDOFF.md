@@ -1,178 +1,280 @@
 # Scanner & QA — 交接文档
 
-> 状态：可用。B 端键盘输出的缩进问题已修复（改为「行内容选中 + 目标缩进替换」的确定性方案，见第 5 节）。
+> 状态：可用。B 端键盘输出的三种策略（机械粘贴 / 规则拟人 / LLM 乱序）都已真机验收；
+> 支持题型自动分流、上下文保留、鼠标一动即停、断点续传。详见各节。
 
 ---
 
-## 1. 项目目标
+## 1. 项目目标与典型工作流
 
-用摄像头/截屏采集"另一台设备（电脑 B）"的屏幕内容，交给视觉 LLM 分析，再把结果用**模拟真人键盘输入**的方式写回目标机器。
+用摄像头/截屏采集"另一台设备（电脑 B）"的屏幕内容，交给视觉 LLM 分析，再把结果用**模拟真人键盘输入**写回 B。
+用于做题/写代码，S 端（Docker 主机）做分析与编排，B 端（Windows）只负责截屏 + 注入按键。
 
-最初设想（鼠标快捷键 → 拍照 → 问 LLM → 浮窗显示）已演化为现在的 B/S 架构。
+典型工作流：
 
-典型工作流（用于做题/写代码）：
-
-1. 在 B 上工作，同时浏览器开着 S 的网页。
-2. 按 `Ctrl+Shift+Alt+8` 给 B 截屏（可连按，多张追加）。
-3. 按 `Ctrl+Shift+Alt+9` 分析：先走"题干抽离层"，再由主 LLM 作答；完成后会话清空。
-4. 按 `Ctrl+Shift+Alt+0` 把最近回答**逐字输入到 B 当前焦点窗口**（VS Code）。
-5. `Ctrl+Shift+Alt+-` 清空；`Ctrl+Shift+Alt++` 停止本次输入。
+1. 在 B 上工作（打开 VS Code），浏览器开着 S 的网页（`http://<S-IP>:8502`）。
+2. `Ctrl+Shift+Alt+8` 给 B 截屏（同一题可连按多张，追加到本轮）。
+3. `Ctrl+Shift+Alt+9` 分析：第一层 LLM 判题型并分流（选择题直接答 / 代码题抽离题干后按语言作答）。
+4. `Ctrl+Shift+Alt+0` 把最近回答**完整输出到 B 当前焦点窗口**（一次会话只做一次）。
+5. 打字过程中**在 B 上移动鼠标**（>10px）即自动停止；停止后按 `Ctrl+Shift+Alt++` **从断点续传**。
+6. `Ctrl+Shift+Alt+-` 清空。
 
 ---
 
 ## 2. 架构
 
 ```
-┌─────────────── 机器 B (Windows，自有) ───────────────┐        ┌──────────── S (Docker 主机) ────────────┐
-│ b_client/capture_agent.py (pythonw / ScannerQA-Agent.exe) │        │ Docker 容器 scanner-and-qa               │
-│  · 长轮询 S 的 /pending 领取任务                        │        │  · serve.py: 先起采集 API(8503) 再起 Streamlit(8501) │
-│  · capture 任务：mss 静默抓主屏 → POST /frame            │  HTTP  │  · webapp/capture_api.py: 任务队列 + 动作 worker + 状态 │
-│  · type 任务：SendInput 把文本注入焦点窗口 → POST /result│ <────> │  · streamlit_app.py: 网页 UI（8502 对外）               │
-│  · 全局热键(pynput)：从 S 拉取组合并热注册               │        │  · app/llm.py: OpenAI 兼容视觉 LLM 客户端               │
-└──────────────────────────────────────────────────────┘        └─────────────────────────────────────────┘
+┌─────────────── 机器 B (Windows) ─────────────────────┐        ┌──────────── S (Docker 主机) ──────────────────┐
+│ b_client/capture_agent.py  →  ScannerQA-Agent.exe     │        │ 容器 scanner-and-qa                            │
+│  · 长轮询 GET /pending 领任务（capture / type）        │        │  · serve.py：先起采集 API(8503)，再起 Streamlit │
+│  · 截屏：mss 抓主屏 → POST /frame                      │  HTTP  │  · webapp/capture_api.py：任务/动作队列 + 编排   │
+│  · 注入：SendInput 键盘注入到焦点窗口 → POST /result    │ <────> │  · streamlit_app.py：网页 UI（对外 8502）        │
+│  · 全局热键(pynput)：从 S /hotkeys 拉取并热注册         │        │  · app/llm.py：OpenAI 兼容 LLM 客户端            │
+│  · 控制线程：长轮询 GET /control（网页停止信号）        │        │  · 端口：8502 → UI，8503 → API                   │
+└───────────────────────────────────────────────────────┘        └────────────────────────────────────────────────┘
 ```
 
 - **S 端无记忆**：图片/对话/回答只在内存；唯一落盘的是 `data/settings.json`（设置，含明文 API Key）。
-- **采集 API 与 Streamlit 同进程**（`serve.py`），worker 线程随容器常驻，所以**不打开网页也能被 B 热键驱动**。
-- 端口：`8502 → Streamlit UI`、`8503 → 采集/任务 API`。
+- **采集 API 与 Streamlit 同进程**（`serve.py`），action worker 常驻，所以**不打开网页也能被 B 热键驱动**。
+- **打字时 B 主循环是同步的**（一次 type 任务可能跑 10–20 分钟，期间不轮询 `/pending`），所以
+  **停止必须走独立控制通道 `GET /control`**；断点续传则靠新一轮 type 任务。
+
+### 2.1 信息流
+
+```
+① 截屏
+  [热键 +8] 或 [网页「📸 截屏」] ──/action {capture}（或进程内 append_action）──▶ [S _actions]
+   [S worker: request_capture] ─▶ [S _jobs {type:capture}]
+   [B 长轮询 /pending] ◀── {type:capture} ── [S]
+   [B] mss 抓屏 → JPEG ──POST /frame──▶ [S _store_frame：0.6s 冷却 + 哈希去重 → _images]
+   说明：收到新截图 = 新一轮会话（`_begin_round_if_needed` 会清上下文/记录，除非本轮还没分析过=连拍追加）。
+
+② 分析（题型自动分流；question_type = auto/code/choice/ask）
+  [热键 +9] 或 [网页「🔎 分析」] ──▶ [S _actions] ──worker: _run_analyze──
+   auto：第一层 LLM(route_prompt, 带图) → 首行 [[CHOICE]] / [[CODE]]
+        ├─ [[CHOICE]] → 直接给选项 → _last_answer（单层，仅网页显示，不输出/不追问）
+        └─ [[CODE]]   → 文本即题干 → 第二层 LLM(语言 prompt + 题干, 不带图) → _last_answer
+   code（手动）：抽离(extract_prompt, 带图) → 第二层 LLM(语言 prompt + 题干) → _last_answer
+   choice（手动）：单层 LLM(choice_prompt, 带图) → _last_answer（仅网页显示、不追问）
+   ask（自由问答）：单层 LLM(prompt, 带图) → _last_answer（保留上下文、可追问）
+   上下文 `_messages`/`_images` **固定保留**，直到"新截图 / 手动清空"。
+   会话记录 `_transcript` 逐条追加（截图/题干/回答/追问/操作），网页对话式回看。
+
+③ 键盘输出
+  [热键 +0] 或 [网页「⌨️ 输入回答」] ──▶ [S _actions] ──worker: _run_type_answer──
+   读 settings：plan_enabled / plan_method(keys|order) / type_target_minutes
+   可选第三阶段：S 生成 keys（键盘流）与 order（行序）两份计划
+   可选时长摊平：_human_timing(answer, target) 覆盖 interval/space/line_pause
+   → request_type(text, options, plan, keys) ─▶ [S _jobs {type:type,...}]
+  [B 长轮询 /pending] ◀── {type:type} ── [S]
+  [B] SendInput 注入：keys 校验通过→type_keys；否则 plan→type_plan；再否则 type_text ──POST /result──▶ [S _last_result]
+
+④ 停止 / 断点续传
+  停止：[B 鼠标移动]（逐字输入时 >mouse_stop_px）→ typer.stop("mouse")
+        [网页「⏹ 停止输入」] ──/action {stop}──▶ request_stop() ─▶ [S _stop_event]
+        [B control-loop GET /control] ◀── {"stop":true} ── [S] → typer.stop("web")
+        停止时：清掉当前半行，B 记录断点 typer.progress（已写完的行 + 当前行号），POST /result 回报
+  续传：[热键 ++] ──/action {resume, done_lines, total_lines}──▶ [S _run_resume]
+        S 对"剩余未写的行"重新生成行序计划 → request_type(plan, resume=True)
+        [B] type_plan(resume=True)：不重建空行，从断点续写剩余行（键盘流中断会先补足空白行）
+
+⑤ 其它
+  [热键 +-] 或 [网页「🧹 清空」] ──▶ clear_all()
+  [网页追问] append_action("ask")：仅网页；选择题不进入上下文所以不支持追问
+```
+
+**快捷键 vs 网页点击**：截屏/分析/输入回答/清空/断点续传 都走**同一个 `_actions` 队列 + 同一个 worker**
+（网页进程内 `append_action()`；快捷键 `POST /action`）。**停止没有快捷键**（鼠标移动 + 网页按钮）。
+`⌨️ 输入到 B`（键盘 Tab）是"输入任意文本框内容"的独立通道，不走第三阶段/时长摊平。
+
+### 2.2 会话生命周期（单向）
+- `Ctrl+Shift+Alt+8`（截屏）= 新一轮：`_begin_round_if_needed()` 清 S 上下文/记录；B 收到 capture 时 `clear_breakpoint()`。
+- `Ctrl+Shift+Alt+9`（分析）→ 产生 `_last_answer`。
+- `Ctrl+Shift+Alt+0`（输入回答）= 本轮只做一次的「从头完整输出」，并丢弃断点。
+- 输出被鼠标/网页停止 → 产生**断点**（B 端保存，半行已清掉）。
+- 之后按 `Ctrl+Shift+Alt++`（断点续传）：S 针对剩余行重新生成计划，B 从断点续写；可反复。
+- **断点保存在 B 端**（`typer.progress`），S 不落库；续传时 B 把 `done_lines`/`total_lines` 临时带给 S。
+
+### 2.3 题型 / 语言 / 输出策略（相互正交）
+- **题型** `question_type = auto | code | choice | ask`（侧栏「📚 题型与语言」，默认 auto）。
+- **语言** `code_language = python | java`，每种一个作答提示词 `language_prompts[lang]`（网页可编辑，代码题第二层用）。
+- **提示词归属**：`route_prompt`=自动分流；`language_prompts`=代码题按语言；`choice_prompt`=选择题；
+  `extract_prompt`=仅手动"代码题"抽离；`prompt`=自由问答 + 语言提示词缺失兜底。
+- **输出策略**（键盘 Tab，与题型/语言正交）：`paste_mode`（机械整段粘贴）/ `indent_mode=human`（规则拟人）/
+  `plan_enabled` + `plan_method`（LLM 键盘流 / LLM 行序）。代码题 = 语言(2) × 策略(3)；选择题 = 1。
+- **目标总时长** `type_target_minutes > 0` 时服务端按答案长度**覆盖** interval/space/line_pause（网页这三项此时灰掉）；
+  填 `0` 才用手动值。
+- **会话记录** `_transcript`：`capture`（新截图）与 `清空` 重置；上下文固定保留。
 
 ---
 
 ## 3. 目录与关键文件
 
 ### S 端（容器）
-- `serve.py`：入口。先 `capture_api.ensure_started()` 再跑 Streamlit CLI。
-- `streamlit_app.py`：网页。三个 Tab：`📸 B 截屏分析`、`⌨️ 键盘输出`、`📷 浏览器拍照`。侧栏分区（LLM / 题干抽离 / B 通道 / 快捷键与行为）各自有保存按钮；键盘 Tab 有独立保存。
+- `serve.py`：入口。先 `capture_api.ensure_started()`，再跑 Streamlit CLI。
+- `streamlit_app.py`：网页。Tab：`📸 B 截屏分析`（含会话记录）、`⌨️ 键盘输出`、`📷 浏览器拍照`。
+  侧栏分区：LLM / 题型与语言 / B 通道 / 快捷键；键盘 Tab 有独立保存。`live_b_tab()` 用 `_transcript` 对话式回看。
 - `webapp/capture_api.py`：核心。
-  - 任务队列 `_jobs`（capture / type）供 B 长轮询 `/pending`。
-  - 动作队列 `_actions` + worker 线程：`capture / analyze / type_answer / ask / clear`。
-  - 会话语义状态：`_images`、`_messages`、`_status`、`_extracted`、`_last_answer`。
-  - `strip_code_fence()`：整段回答被 ``` 包裹时去掉首尾围栏。
-  - HTTP：`GET /health`、`GET /pending?wait=N`、`GET /hotkeys`、`POST /frame`、`POST /result`、`POST /action`。
-- `webapp/settings.py`：设置默认值与读写（含 `hotkeys`、各种 `type_*` 参数）。
-- `app/llm.py`：`LLMClient`（`stream_answer_bytes` / `stream_chat(messages, images)`），图片压缩到最长边 1280。
-- `app/` 其余（`capture.py`/`hotkey.py`/`ui.py`/`config.py`）与根 `main.py` 是最早的**桌面版**，当前 B/S 方案不用，可忽略。
+  - 队列：`_jobs`（capture/type）供 B 轮询；`_actions` + worker（capture/analyze/type_answer/resume/stop/ask/clear）。
+  - 控制通道：`request_stop()` + `_stop_event`；`GET /control?wait=N`。
+  - 会话状态：`_images`、`_messages`、`_status`、`_extracted`、`_last_answer`、`_transcript`、`_round_analyzed`。
+  - 题型：`_run_analyze`、`_route_and_extract`、`_run_code`、`_run_choice`、`_run_free_ask`。
+  - 提示词：`_generate_plan`（行序）、`_generate_keys`（键盘流）、`_ask_plan_json`/`_ask_keystream`（带重试+原始输出记录）。
+  - 时长：`_human_timing`、`_apply_plan_pauses`；续传：`_run_resume`、`_generate_plan_for_lines`。
+  - HTTP：`GET /health`、`GET /pending`、`GET /control`、`GET /hotkeys`、`POST /frame`、`POST /result`、`POST /action`。
+- `webapp/settings.py`：默认值与读写（`hotkeys`；`question_type`/`code_language`/`language_prompts`/`choice_prompt`/
+  `route_prompt`/`extract_prompt`；`plan_enabled`/`plan_method`/`plan_prompt`/`keystream_prompt`；各种 `type_*`）。
+- `app/llm.py`：`LLMClient`（`stream_chat(messages, images)`），图片压到最长边 1280。
+- `app/` 其余与根 `main.py` 是最早的**桌面版**，当前不用，可忽略。
 - `Dockerfile` / `docker-compose.yml` / `requirements-web.txt`。
 
 ### B 端（Windows，`b_client/`）
-- `capture_agent.py`：主力。截图（mss）+ 键盘注入（SendInput）+ 全局热键（pynput）。
-- `config.example.json` → 复制为 `config.json`（填 `server_url`、`token`）。
-- `capture_agent.spec`：PyInstaller 配置（单文件、无控制台）。
-- 构建脚本：`build_exe.bat/ps1`（完整清理构建）、`rebuild.bat/ps1`（**增量重建，日常用**）、`run_source.bat`（直接跑源码最快）。
-- 自启脚本：`install_autostart.bat/ps1`、`uninstall_autostart.bat`。
-- `requirements.txt`：`mss`、`pillow`、`requests`、`pynput`。
+- `capture_agent.py`：主力。截图（mss）+ 键盘注入（SendInput）+ 全局热键（pynput）+ 控制线程。
+  - `type_text`（机械/规则拟人）、`type_plan`（行序计划，支持 `resume`）、`type_keys`（键盘流，执行前回放校验）。
+  - `_KeyMirror`/`simulate_keys`/`keys_valid`：模拟 VS Code 语义，用于键盘流校验与进度。
+  - `_sleep`（可中断）、`_arm_mouse_guard`/`_mouse_moved`（鼠标守卫）、`_clear_current_line`（安全清半行）、
+    `_ensure_blank_lines`（键盘流续传补行）、`typer.progress`（断点，B 端）。
+  - `start_control_loop()`：长轮询 `GET /control`。
+- `config.example.json` → `config.json`（填 `server_url`、`token`）。
+- `capture_agent.spec`；构建脚本 `build_exe.*`（全量）/`rebuild.*`（增量）/`run_source.bat`（跑源码）；
+  自启 `install_autostart.*`；`requirements.txt`：`mss`/`pillow`/`requests`/`pynput`。
 
 ---
 
 ## 4. 协议要点
 
-- B → S 认证：请求头 `X-Auth-Token`，值 = S 端 `B_API_TOKEN`（也即 `settings.json.b_api_token`）。
-- `GET /pending?wait=25` → `{"job": null}` 或 `{"job": {"type":"capture"}}` / `{"job":{"type":"type","text":...,"interval_ms":...,"start_delay_s":...,"humanize":...,"unicode_only":...,"dismiss_suggest":...,"paste_mode":...,"options":{...}}}`。
-- `POST /frame`：原始 JPEG body，收到即追加进 `_images`（带 0.6s 冷却 + 内容哈希去重）。
-- `POST /result`：`{"kind","ok","chars","skipped","error"}`。
-- `POST /action`：B 热键投递 `{"action":"capture|analyze|type_answer|clear"}`；`stop` 只在 B 本地执行。
-- `GET /hotkeys`：返回网页配置的热键组合。
+- 认证：请求头 `X-Auth-Token` = S 的 `B_API_TOKEN`（= `settings.json.b_api_token`）。
+- `GET /pending?wait=25` → `{"job": null}`；或
+  `{"job":{"type":"capture"}}` /
+  `{"job":{"type":"type","text","interval_ms","start_delay_s","humanize","unicode_only","dismiss_suggest","paste_mode","options","plan","keys","resume"}}`。
+- `POST /frame`：原始 JPEG body → `_store_frame`（0.6s 冷却 + 哈希去重）。
+- `POST /result`：`{"kind","ok","chars","skipped","error","progress"}`（`error` 在停止时为 `mouse`/`web`）。
+- `POST /action`：`{"action":"capture|analyze|type_answer|resume|stop|ask|clear", ...}`。
+- `GET /control?wait=N` → `{"stop": bool}`（B 长轮询消费网页停止信号）。
+- `GET /hotkeys` → `{"hotkeys": {...}}`。
 
 ---
 
-## 5. 键盘输出（缩进方案）
+## 5. B 端键盘输出实现
 
-### 实现
-`b_client/capture_agent.py` 的 `SendInputTyper`：
+`SendInputTyper`：
 
-- 逐字注入：`SendInput + KEYEVENTF_UNICODE`（支持中文/emoji）；整段走 `paste_mode` 粘贴。
-- 拟人化：字符间隔随机、换行停顿、低频错字后 Backspace 纠正。
-- `space_interval_ms`：空格与缩进走独立高速间隔。
-- `unicode_only`：跳过非 BMP/代理字符。
+- 逐字注入：`SendInput + KEYEVENTF_UNICODE`（中文/emoji 可用）；`paste_mode` 整段粘贴。
+- 拟人化：字符间隔随机、换行停顿、低频错字 + Backspace 纠正；`_sleep` 分块可中断。
 - 预处理：EOL 归一、清理 NBSP/全角空格/零宽/智能引号、行首 Tab 按 tab stop 展开。
-- 代码模式 `indent_mode`：
-  - `human`（默认，页面选「拟人逐行」）：**逐行对齐** —— 回车后用 `Home`×2 + `Shift+End` 选中该行内容（此时只含编辑器自动缩进空白），再逐字输入「目标缩进 + 正文」替换选区。不读剪贴板、不测量、不删换行，且能保留逐字节奏。
-  - `none`：原样逐字，不做缩进对齐（换行可选 `enter_via_paste`）。
-- 首行不整行替换，直接在光标处输入，避免毁掉光标所在行已有内容。
-- 缩进风格：`indent_style = spaces|tabs`，`tab_size`。
-  - `spaces`：逐字输入空格（保留拟人节奏）。
-  - `tabs`：把缩进串（Tab 字符）粘贴覆盖选区。**不能用 Tab 键**——VS Code 的 Tab 是智能命令：选中整行时是「缩进整行」，空行时会跳到语言推导缩进，无法精确到目标列（依据 `cursorTypeEditOperations.TabOperation`）。粘贴后需给 VS Code 足够处理时间（`0.12s` + `0.25s`）——真机实测 30ms 会被随后键入的正文抢先，导致缩进丢失。
-  - 注：控制字符 `\t`/`\n` 不能走 Unicode 注入（真机实测会被 VS Code 丢弃），换行必须用 `VK_RETURN`。
-- 全局热键：组合由 S 的 `/hotkeys` 下发，B 启动时拉取、每 60s 同步并热注册。
+- 注入限制：控制字符 `\t`/`\n` 走 Unicode 会被 VS Code 丢弃 → 换行必须 `VK_RETURN`；Tab 用 `VK_TAB`。
 
-### 关键结论（历史 bug 根因）
-旧方案用 `Ctrl+L` 选中行再 `Ctrl+C` 读剪贴板「实测」缩进。VS Code 的 `Ctrl+L`（`expandLineSelection`）选中范围是 `(N,1) → (N+1,1)`，**包含行尾换行**；且空行时 `Ctrl+C` 是 no-op，剪贴板会保留旧内容。于是实测恒为 `None/脏值`，而按目标缩进输入时又把换行一起替换掉 → 串行/丢行/无缩进。现已彻底移除对 `Ctrl+L`/`Ctrl+C`/剪贴板测量的依赖。
+**三选一输出策略**
+1. `paste_mode`（机械）：整段剪贴板粘贴（最保真，丢失节奏）。
+2. `indent_mode=human`（规则拟人）：逐行对齐；回车后 `Home`×2 + `Ctrl+[`（outdentLines）×N 把行缩进清 0，
+   再逐字输入「目标缩进 + 正文」。**无选区（不变蓝）**，不读剪贴板测量。
+   - 注意：行首缩进用**整段粘贴**（spaces/tabs 都一样），瞬间到位、避免"逐个空格挪过去"，也避开 VS Code 智能 Tab。
+3. 第三阶段（LLM 计划，`plan_enabled`）：
+   - **键盘流 `keys`（默认）**：LLM 给按键序列，合法元素 `普通文本 / <Enter> / <Tab> / <S-Tab> / <Up> / <Down>`。
+     B 端 `type_keys` 执行前用 `_KeyMirror` 回放 `simulate_keys(keys)==目标` 校验，**不一致则抛错**。
+     缩进由 VS Code 回车自动缩进完成（不再从行首打空格）。`keystream_autoindent`（默认 True）控制假设。
+   - **行序 `order`**：LLM 只给 `{"order":1..N 的排列,"pauses","revisit"}`；B 先建 N 行空行，按 order 逐行填。
+     正文逐行取自回答、不依赖光标算术 → **乱序也保证正确**。
+   - **兜底链**：keys 校验失败 → order 计划 → 再失败 → human 逐字。
 
-### 为什么 `Home`×2 + `Shift+End` 是可靠的（VS Code 源码依据）
-- `Home` = `MoveOperations.moveToBeginningOfLine`：`firstNonBlank = getLineFirstNonWhitespaceColumn || minColumn`。回车后该行只有自动缩进空白，游标在行尾 ≠ 行首，故第一次 `Home` 到第 1 列，第二次仍在第 1 列。
-- `Shift+End` = `moveToEndOfLine`（选择），选到行末但不含换行。
-- 纯空白选区不会触发「输入括号/引号包裹选区」（`SurroundSelectionOperation._isSurroundSelectionType` 对 only-whitespace 返回 false），所以替换选区安全。
+**停止与断点续传**
+- 鼠标守卫：逐字输入时采样 `GetCursorPos`，位移 >`mouse_stop_px`（默认 10）→ `stop("mouse")`；滚轮不改坐标，翻页不影响。
+- 清半行：`Home`×2 → `Shift+End` 选中 → `Delete`（**不用退格 N 次**：自动配对 overtype 会让逻辑字数≠实际字数，多退格会吃掉上一行）。
+- 续传：S 用 B 上报的 `total_lines` 算剩余行、order 只留剩余行并去重；**续传计划无效绝不回退成整段重打**。
+  键盘流中断后 B 先 `_ensure_blank_lines` 补足空白行，再按行序续写。
 
-### 建议的 VS Code 设置
-- `editor.insertSpaces` / `editor.tabSize` 与页面「缩进字符 / tab 宽度」保持一致（文件用 Tab 就选 tabs，用空格就选 spaces；混用会导致 Python `TabError`）。
-- 无需关闭 `editor.autoIndent`（`human` 模式对自动缩进不敏感）。
-- 建议关闭或保持默认的自动闭合括号/引号均可；如出现异常配对/补全，页面保持「IDE 兼容：回车/制表前先按 Esc」勾选。
+**历史坑（已修）**
+- 旧「`Ctrl+L` 选中行 + `Ctrl+C` 读剪贴板实测缩进」：`Ctrl+L`（`expandLineSelection`）选中范围含行尾换行、空行 `Ctrl+C` 是 no-op，导致 `None/脏值`，替换后串行/丢行/无缩进 → 已彻底移除。
+- 全部键盘流的「停止/续传」都建立在可中断 sleep 上。
+
+**建议的 VS Code 设置**：`editor.insertSpaces`/`editor.tabSize` 与页面一致；键盘流模式保持 `autoIndent` 默认（若设 `none`，把 `keystream_autoindent` 设为 False 并让提示词显式用 `<Tab>`）。
 
 ---
 
-## 6. 运行 / 构建
+## 6. 运行 / 构建 / 部署
 
 ### S 端（Docker）
 ```bash
-docker compose up -d --build
-# UI:  http://<S-IP>:8502
-# API: http://<S-IP>:8503
+docker compose up -d --build      # 改了 S 端代码后必须重建
+# UI: http://<S-IP>:8502   API: http://<S-IP>:8503/health
 ```
-`docker-compose.yml` 用 `B_API_TOKEN` 环境变量注入 token；`data/` 挂载持久化设置。
-注意：构建偶尔遇到 buildkit snapshot 报错，重跑 `docker compose build` 即可。
+- token 用环境变量 `B_API_TOKEN` 注入；`data/` 挂载持久化 `settings.json`。
+- `data/settings.json` 为容器内 root 所有，宿主机免 sudo 改不了；可在容器内改：
+  `docker exec -i scanner-and-qa python - <<'PY' ... PY`。
+- 构建偶发 buildkit snapshot 报错，重跑 `docker compose build` 即可。
 
 ### B 端（Windows）
 ```powershell
-# 首次
-b_client\build_exe.bat            # 或 build_exe.ps1
-# 日常增量（改了 capture_agent.py 后）
-b_client\rebuild.bat              # 复用 .build-venv，不加 --clean，几秒
-# 最快（构建机就是运行机时有 Python）
-b_client\run_source.bat
+b_client\build_exe.bat     # 全量
+b_client\rebuild.bat       # 增量（日常）
+b_client\run_source.bat    # 跑源码最快
 ```
-产物：`b_client\dist\ScannerQA-Agent.exe` + 同目录 `config.json`。
-**改了 B 端代码必须重建 exe 并替换 B 上的旧版**（S 端改动则重建 Docker）。
+产物 `b_client\dist\ScannerQA-Agent.exe`（+ 同目录 `config.json`）。**改了 B 端代码必须重建 exe 并替换 B 上的旧版。**
+
+**B 机器当前部署细节（本机实测环境）**
+- 路径：`C:\Users\me\Downloads\b_client`；exe 在 `dist\`，`dist\config.json` 的 `server_url=http://192.168.1.137:8503`、`token=test-token`。
+- agent 通过**计划任务在交互会话 1** 启动（自启脚本已装）；启动新 exe：
+  ```powershell
+  $p = New-ScheduledTaskPrincipal -UserId (whoami) -LogonType Interactive -RunLevel Limited
+  $a = New-ScheduledTaskAction -Execute "C:\Users\me\Downloads\b_client\dist\ScannerQA-Agent.exe" -WorkingDirectory "...\dist"
+  $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+  Register-ScheduledTask -TaskName qaStartAgent -Action $a -Principal $p -Settings $s -Force
+  Start-ScheduledTask qaStartAgent; Start-Sleep 5; schtasks /delete /tn qaStartAgent /f
+  ```
+  （`schtasks` 默认"电池不启动"，务必加 `-AllowStartIfOnBatteries`，否则任务不跑。）
+- **PyInstaller 构建坑**：`uv` 默认管理的 Python 3.14 在这台机器上损坏（`os error 448 不受信任的装入点`）。
+  重建环境要用 3.12：
+  ```powershell
+  C:\Users\me\.local\bin\uv.exe venv --python 3.12 .build-venv
+  C:\Users\me\.local\bin\uv.exe pip install --python .build-venv\Scripts\python.exe -r requirements.txt pyinstaller
+  .build-venv\Scripts\python.exe -m PyInstaller --noconfirm --clean capture_agent.spec
+  ```
+- 已为免密运维把本机运维公钥加进 `C:\ProgramData\ssh\administrators_authorized_keys`（`me` 是管理员，Windows SSH 走这个文件，不是 `~/.ssh/authorized_keys`）。
+- 已通过 SYSTEM 计划任务关闭自动锁屏（`InactivityTimeoutSecs=0`、`NoLockScreen=1`）、屏保、动态锁，并把 AC/DC 的关屏/睡眠/休眠设为从不（否则锁屏后无法注入）。
 
 ---
 
-## 7. 当前运行环境/参数备注
+## 7. 当前运行环境 / 参数备注
 
-- S 主机：Ubuntu 24.04，X11（`DISPLAY=:1`），Docker。
-- 容器：`python:3.12-slim` + Streamlit 1.64（用到 `st.button(shortcut=...)`、`st.fragment(run_every=...)`、`st.iframe`）。
-- B：Windows。
-- 当前 `data/settings.json` 实际值（节选）：模型 `deepseek-v4.1-flash`、`max_tokens=1088`、`prompt` 为"用python做这道题…只回答答案"、`type_enter_via_paste=true`、字符/换行间隔 50ms（页面可调）。注意：`human` 模式不使用剪贴板，`enter_via_paste` 只在 `indent_mode=none` 时生效；若把间隔压到 10ms 以下，可能影响 `paste_mode`/`none` 的剪贴板时序。
-- 安全：`/pending`、`/frame`、`/action`、`/hotkeys` 都需 token；该通道能向 B 注入任意按键，**勿暴露公网**，仅限局域网。
+- S：Ubuntu 24.04，Docker；容器 `python:3.12-slim` + Streamlit。
+- B：Windows（`me` 为管理员；agent 在交互会话 1 常驻）。
+- LLM：`data/settings.json` 里 `model=deepseek-v4.1-flash`，走 OpenAI 兼容端点（`base_url` 指向 B 上的 3000 端口代理）。
+  注意该模型会先花 token 做 **reasoning**；`max_tokens` 太小会只出 reasoning、正文为空，建议 ≥8000。
+- `type_target_minutes` 默认 10（LeetCode 小题约 10 分钟；大题可填 20）。
+- 安全：`/pending`、`/frame`、`/action`、`/hotkeys`、`/control` 都需 token；该通道能向 B 注入任意按键，**勿暴露公网**。
 
 ---
 
 ## 8. 测试
 
-- `tests/test_typer.py`：注入器纯函数与各模式的动作序列（打桩，Linux 可跑）：`python tests/test_typer.py`。
-- `tests/test_vscode_sim.py`：**VS Code 编辑器语义模拟器**，按源码实现 `Home`/`Shift+End`/`Enter` 自动缩进/`Tab`/括号自动配对，用真实文本跑注入器并逐行比对。含空格/制表、有无自动缩进、追加/中段插入等场景：`python tests/test_vscode_sim.py`。
-- 另有开发期 `/tmp/opencode/` 下的临时脚本（未入库）：`test_hotkeys.py`、`test_orchestration.py`、`test_streamlit_*.py`。
-- 建议后续把这些也整理进 `tests/` 并接入 CI。注意：模拟器只能证明「在建模的 VS Code 语义下正确」，最终仍需在真实 Windows/VS Code 上验收。
+仓库内 `tests/`（Linux 可跑，纯打桩 / 内嵌 mock，无需外网；可直接 `python tests/xxx.py` 或 pytest）：
 
-### 真机验收记录（已做）
-在 B（Windows，VS Code，交互会话）上用 `SendInput` 对真实 VS Code 输入《接雨水》示例并 `Ctrl+S` 后回读文件：
-- `indent_style=spaces`：PASS
-- `indent_style=tabs`：PASS（需上面的粘贴 settle 时间）
-- 验证方法：`explorer.exe`/计划任务在会话 1 启动一个新 VS Code 窗口 → 输入 → 保存 → 读取文件比对。
+- `tests/test_typer.py`：注入器纯函数、human/none 动作序列、plan 校验/子集、**键盘流回放校验/缩进继承**、
+  **鼠标停止**、plan 执行导航。
+- `tests/test_vscode_sim.py`：**VS Code 语义模拟器**（`Home`/`Ctrl+[`/Enter 自动缩进/Tab/S-Tab/Up/Down/括号配对），
+  用真实文本跑注入器并逐行比对：human、plan(order) 乱序、**键盘流**、**停止→安全清半行→断点续传**、
+  键盘流校验失败抛错。
+- `tests/test_hotkeys.py`：热键解析/映射/重映射、缺修饰键不触发、char 回退、**resume 带断点进度**。
+- `tests/test_orchestration.py`：内嵌 mock LLM，覆盖 **/frame 入库去重、题型自动分流（代码/选择）、手动自由问答、
+  追问保留上下文、新截图开新会话、输入回答同时带 keys+plan、断点续传、/control 停止通道、plan/keys JSON 解析容错**。
+- `tests/test_streamlit_ui.py`：AppTest 渲染无异常 + 关键控件齐全 + 按钮投递动作（截屏/分析/清空）。
+
+> 注意：模拟器只证明"在建模的 VS Code 语义下正确"，真机行为以第 8 节下方的验收记录为准。
+
+### 真机验收记录（已在 B 上做过，均 PASS）
+- 规则拟人 `indent_style=spaces` / `tabs`：输出《接雨水》示例，`Ctrl+S` 后回读文件逐字符一致。
+- 第三阶段行序 `plan(order)`：乱序计划在真实 VS Code 上输出正确。
+- 停止 + 断点续传：逐字中移鼠标 → `原因=mouse`、半行清掉、上一行完好 → `++` 续写 → 文件一致。
+- 网页停止控制通道：网页 `stop` → B 日志 `收到网页停止指令`。
+- 键盘流 `keys`：`["def f(a):","<Enter>","b = a[0]","<Enter>","return b + 1"]` 真机输出与源码一致。
+- 方法：计划任务在会话 1 打开新 VS Code 窗口 → 注入 → 保存 → 回读比对。
 
 ---
 
-## 9. 下一步（可选）
+## 9. 已知取舍 / 下一步
 
-键盘缩进问题已按第 5 节方案修复。后续可选：
-
-1. 在真实 VS Code 上验证 `human` 模式（建议先用 `run_source.bat` 免构建验证）；观察日志 `%LOCALAPPDATA%\scanner-qa\agent.log`。
-2. 视需要补充「整段粘贴」与 `human` 模式的一键切换体验（页面已有缩进策略 + 整段粘贴选项）。
-3. 处理缩进之外仍可能影响 IDE 的因素：自动补全弹窗、括号/引号自动配对。
-4. 将 `/tmp/opencode` 的临时测试并入 `tests/` 并接入 CI。
-
----
-
-## 10. 已知取舍（供决策）
-
-- **逐字模拟 vs 保真**：`human` 模式逐字更像真人、保留行间节奏且缩进确定；`paste_mode` 整段粘贴最保真但失去节奏。
-- **服务端单例会话**：多个浏览器窗口共享同一份图片/对话，`清空` 会影响所有窗口。
-- **图片不落盘**，但**设置（含 API Key）明文落盘**在 `data/settings.json`（按用户要求保持现状）。
+- **逐字模拟 vs 保真**：`human`/`keys` 更像真人、保留节奏；`paste_mode` 最保真但无节奏。
+- **服务端单例会话**：多窗口共享同一份图片/对话；`清空` 影响所有窗口。
+- **图片不落盘**；**设置（含 API Key）明文落盘**在 `data/settings.json`（按用户要求）。
+- 可继续做：给 `tests/` 接入 CI；第三阶段提示词继续在网页里迭代；
+  如需更"无声"的缩进观感，可评估 `editor.autoIndent:"none"` + 键盘流显式 `<Tab>`。

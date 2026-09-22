@@ -25,7 +25,8 @@ ca._vk_input = lambda vk, keyup: ("vk", vk, keyup)
 ca._unicode_input = lambda code, keyup: ("uni", code, keyup)
 for name, val in {
     "_VK_RETURN": 0x0D, "_VK_TAB": 0x09, "_VK_BACK": 0x08, "_VK_ESCAPE": 0x1B,
-    "_VK_SHIFT": 0x10, "_VK_HOME": 0x24, "_VK_END": 0x23,
+    "_VK_HOME": 0x24, "_VK_END": 0x23, "_VK_UP": 0x26, "_VK_DOWN": 0x28,
+    "_VK_OEM_4": 0xDB,
     "_VK_CONTROL": 0x11, "_VK_V": 0x56,
 }.items():
     setattr(ca, name, val)
@@ -34,6 +35,7 @@ clipboard = {}
 paste_called = {"n": 0}
 ca._set_clipboard_text = lambda t: clipboard.__setitem__("text", t)
 ca._paste_shortcut = lambda: paste_called.__setitem__("n", paste_called["n"] + 1)
+ca._cursor_pos = lambda: None   # 非 Windows：鼠标守卫打桩
 
 
 def reset():
@@ -128,7 +130,9 @@ def test_space_speed():
     typer = make_typer(space_interval_ms=7)
     with mock.patch("time.sleep", lambda s: sleeps.append(s)):
         typer.type_text("a b", 100, 0, humanize=False, dismiss_suggest=False)
-    assert 0.007 in sleeps and 0.1 in sleeps, sleeps
+    # _sleep 会分块（≤50ms）：空格总计 7ms，两个普通字符各 100ms
+    assert any(abs(s - 0.007) < 1e-9 for s in sleeps), sleeps
+    assert abs(sum(sleeps) - 0.207) < 0.03, sum(sleeps)
     print("[ok] 空格走独立高速间隔")
 
 
@@ -136,13 +140,15 @@ def test_space_speed():
 CODE = 'def test():\n    if True:\n        print("A")\n    print("B")'
 
 
-def test_select_line_content():
+def test_clear_line_indent():
     reset()
     typer = ca.SendInputTyper({"typo_rate": 0})
-    typer._select_line_content()
-    # 两次 Home + Shift+End（不含 Delete / Ctrl+L / Ctrl+C）
-    assert action_trace() == ["VK24", "VK24", "VK10", "VK23"], action_trace()
-    print("[ok] _select_line_content：Home×2 + Shift+End")
+    typer._clear_line_indent()
+    trace = action_trace()
+    assert trace.count("VKDB") == ca._OUTDENT_PRESSES, trace
+    assert trace[-1] == "VK24", trace
+    assert "VK10" not in trace and "VK23" not in trace and "VK4C" not in trace, trace
+    print("[ok] _clear_line_indent：Ctrl+[ 清缩进 + Home，无选区")
 
 
 def test_human_mode():
@@ -150,15 +156,14 @@ def test_human_mode():
     typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
     typer.type_text(CODE, 0, 0, humanize=False, dismiss_suggest=False)
     trace = action_trace()
-    # 每行正文前，非首行都是 Enter + Home×2 + Shift+End
     assert trace.count("VK0D") == 3, trace
-    assert trace.count("VK24") == 6, trace            # 3 个换行 × 2 次 Home
-    assert trace.count("VK23") == 3, trace
-    assert "VK4C" not in trace and "VK43" not in trace, trace  # 不再用 Ctrl+L/C
+    assert trace.count("VK24") == 3, trace                          # 每行 1 次 Home
+    assert trace.count("VKDB") == ca._OUTDENT_PRESSES * 3, trace    # 每行 Ctrl+[
+    assert "VK4C" not in trace and "VK43" not in trace, trace      # 不再用 Ctrl+L/C
+    assert "VK10" not in trace and "VK23" not in trace, trace      # 不再 Shift+End 选区
     assert "VK08" not in trace, trace
-    # 首行前不应出现 Home（首行不整行替换）
-    assert trace.index("d") == 0, trace
-    print("[ok] human 模式：逐行对齐，不碰剪贴板/Ctrl+L")
+    assert trace.index("d") == 0, trace                            # 首行直接输入
+    print("[ok] human 模式：逐行对齐，无选区、不碰剪贴板/Ctrl+L")
 
 
 def test_human_ignores_enter_via_paste():
@@ -183,6 +188,88 @@ def test_indent_spaces_and_tabs():
     print("[ok] human + tabs：缩进串粘贴，不用 Tab 键")
 
 
+def test_parse_plan():
+    P = ca.SendInputTyper._parse_plan
+    assert P({"order": [2, 1, 3]}, 3) is not None
+    assert P({"order": [1, 1, 3]}, 3) is None      # 重复
+    assert P({"order": [1, 2]}, 3) is None         # 缺行
+    assert P("x", 3) is None
+    order, pauses, rev = P({"order": [1, 2, 3],
+                            "pauses": [{"after": 1, "ms": 500}, {"after": 9, "ms": 1}],
+                            "revisit": [2, 99, 2]}, 3)
+    assert order == [1, 2, 3]
+    assert pauses == {1: 500.0}
+    assert rev == [2]
+    print("[ok] plan 校验/归一化")
+
+
+def test_keys_helpers():
+    code = "def f():\n    return 1"
+    # 回车对 : 结尾自动加一级缩进，所以无需 <Tab>
+    assert ca.keys_valid(["def f():", "<Enter>", "return 1"], code)
+    assert not ca.keys_valid(["def f():"], code)
+    assert ca.simulate_keys(["a", "<Enter>", "<Tab>", "b"]) == "a\n    b"
+    assert ca.simulate_keys(["    x", "<Enter>", "y"]) == "    x\n    y"   # 回车继承缩进
+    # 关掉自动缩进时，需要显式 <Tab>
+    assert ca.simulate_keys(["if x:", "<Enter>", "<Tab>", "y"], auto_indent=False) \
+        == "if x:\n    y"
+    print("[ok] 键盘流回放校验/缩进继承")
+
+
+def test_plan_subset():
+    P = ca.SendInputTyper._parse_plan
+    assert P({"order": [2, 4]}, 5, subset=True) is not None
+    assert P({"order": [1, 2, 3, 4, 5]}, 5, subset=True) is not None
+    assert P({"order": []}, 5, subset=True) is None
+    assert P({"order": [2, 2]}, 5, subset=True) is None
+    assert P({"order": [6]}, 5, subset=True) is None
+    assert P({"order": [2, 4]}, 5) is None      # 非子集模式要求全排列
+    print("[ok] plan 子集校验（断点续传）")
+
+
+def test_mouse_stop():
+    reset()
+    positions = {"n": 0}
+
+    def fake_pos():
+        positions["n"] += 1
+        return (0, 0) if positions["n"] == 1 else (100, 0)
+
+    ca._cursor_pos = fake_pos
+    try:
+        typer = ca.SendInputTyper({"indent_mode": "none", "typo_rate": 0,
+                                   "mouse_stop_enabled": True, "mouse_stop_px": 10})
+        typer.type_text("abcdef", 0, 0, humanize=False, dismiss_suggest=False)
+    finally:
+        ca._cursor_pos = lambda: None
+    assert typer.stopped and typer.stop_reason == "mouse", typer.stop_reason
+    assert typer.typed < 6
+    print("[ok] 鼠标移动触发停止（mouse）")
+
+
+def test_plan_invalid_raises():
+    typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
+    try:
+        typer.type_plan("a\nb", {"order": [1, 1]}, 0, 0, humanize=False,
+                        dismiss_suggest=False)
+    except ValueError:
+        print("[ok] plan.order 非法时抛 ValueError（供回退）")
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_plan_execution_trace():
+    reset()
+    typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
+    typer.type_plan("aa\nbb", {"order": [2, 1]}, 0, 0, humanize=False,
+                    dismiss_suggest=False)
+    trace = action_trace()
+    assert trace.count("VK0D") == 1, trace              # 建 2 行需要 1 个回车
+    assert "VK26" in trace and "VK28" not in trace, trace  # 仅向上导航
+    assert trace[-1] == "a" and "b" in trace, trace
+    print("[ok] plan 执行：建行 + 乱序 + 导航")
+
+
 def test_line0_not_replaced():
     reset()
     typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
@@ -200,11 +287,17 @@ def _run_all():
     test_enter_via_paste()
     test_timing_defaults()
     test_space_speed()
-    test_select_line_content()
+    test_clear_line_indent()
     test_human_mode()
     test_human_ignores_enter_via_paste()
     test_indent_spaces_and_tabs()
     test_line0_not_replaced()
+    test_parse_plan()
+    test_plan_subset()
+    test_keys_helpers()
+    test_mouse_stop()
+    test_plan_invalid_raises()
+    test_plan_execution_trace()
     print("TYPER LOGIC OK")
 
 
