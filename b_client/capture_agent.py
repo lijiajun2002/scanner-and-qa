@@ -222,6 +222,8 @@ TYPING_DEFAULTS = {
     "mouse_stop_enabled": True,  # 逐字输入时鼠标移动超过阈值则自动停止
     "mouse_stop_px": 10,         # 位移阈值（像素）；滚轮不改变指针坐标，不影响翻页
     "keystream_autoindent": True,  # 键盘流校验时假定 VS Code 回车自动缩进（关掉则用 autoIndent:none）
+    "auto_indent": True,         # VS Code 开启 editor.autoIndent：human 模式据此做相对缩进微调
+    "auto_pairing": True,        # VS Code 自动配对开括号/引号：输入后按 Delete 去掉自动补的闭符号，避免重复
 }
 
 _TYPO_POOL = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -274,6 +276,80 @@ def build_indent(cols: int, style: str, tab_size: int) -> str:
     if style == "tabs":
         return "\t" * (cols // tab_size) + " " * (cols % tab_size)
     return " " * cols
+
+
+# 开括号 → 对应闭符号；用于 auto_pairing 时去掉 VS Code 自动补的闭符号
+_PAIR_CLOSE = {"(": ")", "[": "]", "{": "}"}
+# VS Code 回车后自动加一级缩进的常见行尾（Python 的 : / C 系的 { / 续行的 ( [）
+_AUTO_INDENT_TAILS = (":", "{", "(", "[")
+
+
+def auto_indent_level(prev_level: int, prev_body: str) -> int:
+    """回车后 VS Code 的自动缩进级数：上一行以 : { ( [ 结尾时多一级。"""
+    base = max(0, int(prev_level))
+    if prev_body.rstrip().endswith(_AUTO_INDENT_TAILS):
+        return base + 1
+    return base
+
+
+def code_mask(body: str) -> list[bool]:
+    """标记每个字符是否处于"代码"（非字符串/注释）中。
+
+    仅用于决定开括号/引号是否要做自动配对处理；支持 // 与 # 行注释、/* */ 块注释、
+    单/双引号与三引号字符串（含反斜杠转义）。行注释按整行剩余处理（正文按行输入）。
+    """
+    mask = [True] * len(body)
+    i, n = 0, len(body)
+    state = "code"   # code / string / line_comment / block_comment
+    quote = ""
+    while i < n:
+        ch = body[i]
+        if state == "code":
+            if ch == "/" and i + 1 < n and body[i + 1] == "/":
+                for j in range(i, n):
+                    mask[j] = False
+                break
+            if ch == "#":
+                for j in range(i, n):
+                    mask[j] = False
+                break
+            if ch == "/" and i + 1 < n and body[i + 1] == "*":
+                state = "block_comment"
+            elif ch in ('"', "'"):
+                triple = body[i:i + 3]
+                if triple in ('"""', "'''"):
+                    quote = triple
+                    for j in range(i, min(i + 3, n)):
+                        mask[j] = False
+                    i += 3
+                    state = "string"
+                    continue
+                quote = ch
+                mask[i] = True          # 开引号本身算"代码"（要做配对处理），字符串内容不算
+                i += 1
+                state = "string"
+                continue
+        elif state == "string":
+            mask[i] = False
+            if body[i:i + len(quote)] == quote:
+                for j in range(i, min(i + len(quote), n)):
+                    mask[j] = False
+                i += len(quote)
+                state = "code"
+                continue
+            if len(quote) == 1 and ch == "\\" and i + 1 < n:
+                mask[i + 1] = False
+                i += 2
+                continue
+        elif state == "block_comment":
+            mask[i] = False
+            if ch == "*" and i + 1 < n and body[i + 1] == "/":
+                mask[i + 1] = False
+                i += 2
+                state = "code"
+                continue
+        i += 1
+    return mask
 
 
 # ==================== 键盘流（LLM 直接给按键序列） ====================
@@ -632,17 +708,56 @@ class SendInputTyper:
             if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
                 self.typed += 1
 
+    def _adjust_indent(self, have: int, want: int, dismiss: bool) -> None:
+        """从当前缩进级数 have 用 Tab / S-Tab 微调到 want（不回行首、不粘贴缩进）。"""
+        if want > have:
+            for _ in range(want - have):
+                self._tap(_VK_TAB, dismiss)
+        elif have > want:
+            for _ in range(have - want):
+                self._shift_tab()
+
+    def _type_body_code(self, body: str, interval_ms: int, humanize: bool,
+                        unicode_only: bool, dismiss: bool) -> int:
+        """逐字输入一行正文，返回输入的逻辑字符数。
+
+        auto_pairing 开启时：遇到代码中的开括号/引号，若目标下一个字符不是对应
+        闭符号，就按一次 Delete 去掉 VS Code 自动补的闭符号，避免"后面缀着一层闭括号"。
+        字符串/注释内的括号不做处理（那里 VS Code 不会自动配对）。
+        """
+        mask = code_mask(body) if self.options.get("auto_pairing") else None
+        self._arm_mouse_guard()
+        typed = 0
+        for i, ch in enumerate(body):
+            if self._stop.is_set():
+                break
+            if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
+                typed += 1
+                self.typed += 1
+            if mask is not None and mask[i]:
+                close = _PAIR_CLOSE.get(ch)
+                if close is None and ch in ('"', "'"):
+                    close = ch
+                if close is not None:
+                    nxt = body[i + 1] if i + 1 < len(body) else ""
+                    if nxt != close:
+                        _send_inputs(_vk_input(_VK_DELETE, False), _vk_input(_VK_DELETE, True))
+        return typed
+
     def _type_code(self, text: str, interval_ms: int, humanize: bool,
                    unicode_only: bool, dismiss: bool) -> None:
-        """逐行对齐输入：每行独立处理缩进，正文仍逐字输入以保留拟人节奏。
+        """规则拟人（相对缩进）：逐行输入，回车后用自动缩进做基准、Tab/S-Tab 微调。
 
-        首行不整行替换（避免毁掉光标所在行已有内容）；其余行先回车，
-        再选中该行空白并用目标缩进替换，然后输入正文。
+        - 不再每行清 0 重排（不再 Home / Ctrl+[ / 粘贴缩进），只做必要的最小调整。
+        - 首行从假定 0 级微调到目标；正文用 _type_body_code（含括号配对处理）。
         """
-        tab_size = int(self.options["tab_size"])
+        tab_size = max(1, int(self.options["tab_size"]))
         lines = split_code_lines(text, tab_size)
         done: set[int] = set()
         total = len(lines)
+        prev_level = 0
+        prev_body = ""
+        auto_indent = bool(self.options.get("auto_indent", True))
 
         for index, (cols, body) in enumerate(lines):
             if self._stop.is_set():
@@ -651,24 +766,26 @@ class SendInputTyper:
             line_no = index + 1
             self.progress = {"done_lines": sorted(done), "current_line": line_no,
                              "total_lines": total}
+            want = cols // tab_size
 
             if index == 0:
-                typed = self._type_indent_cols(cols, dismiss)
+                if auto_indent:
+                    self._adjust_indent(0, want, dismiss)
+                else:
+                    self._type_indent_cols(cols, dismiss)
             else:
                 # 代码模式一律用真实回车，避免剪贴板竞态与不触发自动缩进的问题
                 self._press_enter(humanize, int(interval_ms), dismiss, False)
-                # 不选中整行（会变蓝），改用 Ctrl+[ 清掉自动缩进再输入目标缩进
-                self._clear_line_indent(dismiss)
-                typed = self._type_indent_cols(cols, dismiss)
+                if auto_indent:
+                    # 自动缩进给基准，只做必要的最小 Tab/S-Tab 微调
+                    self._adjust_indent(auto_indent_level(prev_level, prev_body), want, dismiss)
+                else:
+                    # autoIndent:none：回车不带缩进，沿用"清 0 再补目标缩进"的绝对对齐
+                    self._clear_line_indent(dismiss)
+                    self._type_indent_cols(cols, dismiss)
 
-            self._arm_mouse_guard()
-            for ch in body:
-                if self._stop.is_set():
-                    self.stopped = True
-                    break
-                if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
-                    typed += 1
-                    self.typed += 1
+            typed = self._type_body_code(body, int(interval_ms), humanize,
+                                         unicode_only, dismiss)
             if self.stopped:
                 if typed > 0:
                     self._clear_current_line()  # 安全清掉当前半行
@@ -676,6 +793,8 @@ class SendInputTyper:
                                  "total_lines": total}
                 break
             done.add(line_no)
+            prev_level = want
+            prev_body = body
 
     # ==================== 第三阶段：按 LLM 给的"人类写作顺序"输入 ====================
     @staticmethod
@@ -772,12 +891,8 @@ class SendInputTyper:
             _paste_shortcut()
             self._sleep(150)
             typed += len(indent)
-        for ch in body:
-            if self._stop.is_set():
-                break
-            if self._type_char(ch, humanize, int(interval_ms), unicode_only, dismiss):
-                typed += 1
-                self.typed += 1
+        typed += self._type_body_code(body, int(interval_ms), humanize,
+                                      unicode_only, dismiss)
         if self._stop.is_set():
             if typed > 0:
                 self._clear_current_line()   # 安全清掉当前半行（不依赖字数、不碰上一行）

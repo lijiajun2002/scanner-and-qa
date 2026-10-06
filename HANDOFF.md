@@ -166,9 +166,13 @@
 
 **三选一输出策略**
 1. `paste_mode`（机械）：整段剪贴板粘贴（最保真，丢失节奏）。
-2. `indent_mode=human`（规则拟人）：逐行对齐；回车后 `Home`×2 + `Ctrl+[`（outdentLines）×N 把行缩进清 0，
-   再逐字输入「目标缩进 + 正文」。**无选区（不变蓝）**，不读剪贴板测量。
-   - 注意：行首缩进用**整段粘贴**（spaces/tabs 都一样），瞬间到位、避免"逐个空格挪过去"，也避开 VS Code 智能 Tab。
+2. `indent_mode=human`（规则拟人，**相对缩进微调**）：逐行输入；回车后用 VS Code 自动缩进作基准，
+   只在需要时用 `Tab/S-Tab` 微调到目标级数（`auto_indent_level` 认为 `: { ( [` 结尾会多一级），
+   **不再回行首、不再 `Ctrl+[` 清 0、不粘贴缩进**。
+   - 依据 `auto_indent`（对应 `editor.autoIndent`）：为 False 时退回旧的"清 0 + 绝对对齐"（`Home`+`Ctrl+[`+粘贴）。
+   - 开括号/引号自动配对：`auto_pairing`（对应 `editor.autoClosingBrackets/Quotes`）开启时，输入开括号/引号后
+     若目标下一个字符不是对应闭符号，就按一次 `Delete` 去掉 VS Code 自动补的闭符号，**避免"后面缀一层闭括号"**；
+     `code_mask()` 做轻量词法，字符串/注释内的括号不做处理。
 3. 第三阶段（LLM 计划，`plan_enabled`）：
    - **键盘流 `keys`（默认）**：LLM 给按键序列，合法元素 `普通文本 / <Enter> / <Tab> / <S-Tab> / <Up> / <Down>`。
      B 端 `type_keys` 执行前用 `_KeyMirror` 回放 `simulate_keys(keys)==目标` 校验，**不一致则抛错**。
@@ -187,7 +191,7 @@
 - 旧「`Ctrl+L` 选中行 + `Ctrl+C` 读剪贴板实测缩进」：`Ctrl+L`（`expandLineSelection`）选中范围含行尾换行、空行 `Ctrl+C` 是 no-op，导致 `None/脏值`，替换后串行/丢行/无缩进 → 已彻底移除。
 - 全部键盘流的「停止/续传」都建立在可中断 sleep 上。
 
-**建议的 VS Code 设置**：`editor.insertSpaces`/`editor.tabSize` 与页面一致；键盘流模式保持 `autoIndent` 默认（若设 `none`，把 `keystream_autoindent` 设为 False 并让提示词显式用 `<Tab>`）。
+**建议的 VS Code 设置**：`editor.insertSpaces`/`editor.tabSize` 与页面一致；human 模式保持 `autoIndent` 默认（关掉则把 `auto_indent` 设为 False）；自动括号配对保持默认（关掉则把 `auto_pairing` 设为 False）。键盘流模式保持 `autoIndent` 默认（若设 `none`，把 `keystream_autoindent` 设为 False 并让提示词显式用 `<Tab>`）。
 
 ---
 

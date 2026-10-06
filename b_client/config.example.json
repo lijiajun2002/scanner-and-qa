@@ -22,5 +22,10 @@
   "indent_mode": "human",
   "indent_style": "spaces",
   "tab_size": 4,
-  "clean_invisibles": true
+  "clean_invisibles": true,
+
+  "_comment_auto_indent": "对应 VS Code editor.autoIndent。开启时 human 模式按回车自动缩进做相对微调；关闭则退回清0绝对对齐。",
+  "auto_indent": true,
+  "_comment_auto_pairing": "对应 VS Code editor.autoClosingBrackets/Quotes。开启时输入开括号/引号后按 Delete 去掉自动补的闭符号，避免重复闭括号。",
+  "auto_pairing": true
 }

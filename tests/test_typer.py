@@ -26,8 +26,8 @@ ca._unicode_input = lambda code, keyup: ("uni", code, keyup)
 for name, val in {
     "_VK_RETURN": 0x0D, "_VK_TAB": 0x09, "_VK_BACK": 0x08, "_VK_ESCAPE": 0x1B,
     "_VK_HOME": 0x24, "_VK_END": 0x23, "_VK_UP": 0x26, "_VK_DOWN": 0x28,
-    "_VK_OEM_4": 0xDB,
-    "_VK_CONTROL": 0x11, "_VK_V": 0x56,
+    "_VK_OEM_4": 0xDB, "_VK_DELETE": 0x2E,
+    "_VK_CONTROL": 0x11, "_VK_V": 0x56, "_VK_SHIFT": 0x10,
 }.items():
     setattr(ca, name, val)
 
@@ -157,13 +157,15 @@ def test_human_mode():
     typer.type_text(CODE, 0, 0, humanize=False, dismiss_suggest=False)
     trace = action_trace()
     assert trace.count("VK0D") == 3, trace
-    assert trace.count("VK24") == 3, trace                          # 每行 1 次 Home
-    assert trace.count("VKDB") == ca._OUTDENT_PRESSES * 3, trace    # 每行 Ctrl+[
-    assert "VK4C" not in trace and "VK43" not in trace, trace      # 不再用 Ctrl+L/C
-    assert "VK10" not in trace and "VK23" not in trace, trace      # 不再 Shift+End 选区
+    assert "VK24" not in trace, trace                               # 不再回行首
+    assert "VKDB" not in trace, trace                               # 不再 Ctrl+[ 清缩进
+    assert "VK4C" not in trace and "VK43" not in trace, trace       # 不再用 Ctrl+L/C
+    assert "VK23" not in trace, trace                               # 不再 Shift+End 选区
     assert "VK08" not in trace, trace
-    assert trace.index("d") == 0, trace                            # 首行直接输入
-    print("[ok] human 模式：逐行对齐，无选区、不碰剪贴板/Ctrl+L")
+    assert trace.index("d") == 0, trace                             # 首行直接输入
+    # 最后一行 print("B") 自动缩进多一级 → S-Tab 收回一级
+    assert "VK10" in trace and trace.count("VK09") == 1, trace
+    print("[ok] human 模式：相对缩进微调，不回行首/不粘贴缩进")
 
 
 def test_human_ignores_enter_via_paste():
@@ -180,12 +182,59 @@ def test_indent_spaces_and_tabs():
     reset()
     typer = ca.SendInputTyper({"indent_mode": "human", "indent_style": "tabs",
                                "tab_size": 4, "typo_rate": 0})
-    typer.type_text("if x:\n    y()", 0, 0, humanize=False, dismiss_suggest=False)
+    # 第 2 行目标 2 级，自动缩进只给 1 级 → 补 1 次 Tab；且不碰剪贴板
+    typer.type_text("if x:\n        y()", 0, 0, humanize=False, dismiss_suggest=False)
     trace = action_trace()
-    assert "VK09" not in trace, trace          # 不再依赖 Tab 键
-    assert clipboard.get("text") == "\t"       # 缩进串整体粘贴，防 VS Code 智能 Tab
-    assert paste_called["n"] == 1
-    print("[ok] human + tabs：缩进串粘贴，不用 Tab 键")
+    assert trace.count("VK09") == 1, trace
+    assert paste_called["n"] == 0 and clipboard == {}, (paste_called, clipboard)
+    print("[ok] human：按目标级数 Tab 微调，不再粘贴缩进")
+
+
+def test_human_java_braces_no_home():
+    reset()
+    typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
+    code = "class A {\n    int x;\n}"
+    typer.type_text(code, 0, 0, humanize=False, dismiss_suggest=False)
+    trace = action_trace()
+    assert "VK24" not in trace and "VKDB" not in trace, trace   # 不回行首、不清缩进
+    assert trace.count("VK0D") == 2, trace
+    # 第 2 行自动缩进 1 级=目标；第 3 行 `}` 目标 0 级 → S-Tab
+    assert "VK10" in trace, trace
+    # 开大括号自动带闭括号 → 按 1 次 Delete 去掉，避免重复
+    assert trace.count("VK2E") == 1, trace
+    print("[ok] human + Java 大括号：微调缩进 + 去掉自动配对的闭括号")
+
+
+def test_pairing_inside_string_not_deleted():
+    reset()
+    typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
+    typer.type_text('s = f"{x}"', 0, 0, humanize=False, dismiss_suggest=False)
+    trace = action_trace()
+    # 只有开引号会触发一次 Delete；字符串内的 { } 不做配对处理
+    assert trace.count("VK2E") == 1, trace
+    print("[ok] 字符串内的括号不触发配对 Delete")
+
+
+def test_auto_pairing_off():
+    reset()
+    typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0,
+                               "auto_pairing": False})
+    typer.type_text("class A {\n    int x;\n}", 0, 0, humanize=False,
+                    dismiss_suggest=False)
+    assert "VK2E" not in action_trace(), action_trace()
+    print("[ok] auto_pairing=False 时不按 Delete")
+
+
+def test_code_mask_and_auto_indent():
+    assert ca.auto_indent_level(0, "def f():") == 1
+    assert ca.auto_indent_level(1, "if x:") == 2
+    assert ca.auto_indent_level(0, "class A {") == 1
+    assert ca.auto_indent_level(2, "return 1") == 2
+    m = ca.code_mask('a = "{x}" # {y}')
+    assert m[4] is True and m[5] is False        # 开引号 True，字符串内 { False
+    body = 'a = "{x}" # {y}'
+    assert all(not v for v in m[body.index("#"):])  # 注释全 False
+    print("[ok] auto_indent_level / code_mask")
 
 
 def test_parse_plan():
@@ -273,11 +322,11 @@ def test_plan_execution_trace():
 def test_line0_not_replaced():
     reset()
     typer = ca.SendInputTyper({"indent_mode": "human", "typo_rate": 0})
-    # 首行有缩进时，只输入空格，不做选区替换
+    # 首行目标 1 级：从假定 0 级 Tab 一次，再输入正文（不做选区替换）
     typer.type_text("    x", 0, 0, humanize=False, dismiss_suggest=False)
     trace = action_trace()
-    assert trace == [" ", " ", " ", " ", "x"], trace
-    print("[ok] 首行不整行替换")
+    assert trace == ["VK09", "x"], trace
+    print("[ok] 首行只 Tab 微调，不做整行替换")
 
 
 def _run_all():
@@ -291,6 +340,10 @@ def _run_all():
     test_human_mode()
     test_human_ignores_enter_via_paste()
     test_indent_spaces_and_tabs()
+    test_human_java_braces_no_home()
+    test_pairing_inside_string_not_deleted()
+    test_auto_pairing_off()
+    test_code_mask_and_auto_indent()
     test_line0_not_replaced()
     test_parse_plan()
     test_plan_subset()

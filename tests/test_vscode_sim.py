@@ -357,7 +357,7 @@ def _check(label, insert_spaces, indent_style, auto_indent=True, auto_close=True
     ed = VSCode(insert_spaces=insert_spaces, tab_size=4,
                 auto_indent=auto_indent, auto_close=auto_close)
     run_injector(ed, TRAP, indent_mode="human", indent_style=indent_style,
-                 tab_size=4)
+                 tab_size=4, auto_indent=auto_indent, auto_pairing=auto_close)
     expected = to_style(TRAP, indent_style, 4)
     ok = ed.text() == expected
     print(f"[{'ok' if ok else 'FAIL'}] {label}")
@@ -403,7 +403,8 @@ def _check_plan(label, indent_style, auto_indent=True, auto_close=True):
         "pauses": [{"after": 1, "ms": 300}, {"after": 8, "ms": 500}],
         "revisit": [5, 10],
     }
-    run_plan(ed, TRAP, plan, indent_style=style, tab_size=4)
+    run_plan(ed, TRAP, plan, indent_style=style, tab_size=4,
+             auto_pairing=auto_close)
     expected = to_style(TRAP, style, 4)
     ok = ed.text() == expected
     print(f"[{'ok' if ok else 'FAIL'}] {label}")
