@@ -3,8 +3,8 @@ services:
     build: .
     image: scanner-and-qa:latest
     container_name: scanner-and-qa
-    # 用 host 网络以便直接访问局域网里的主机 B 和 LLM 端点
-    network_mode: host
+    ports:
+      - "${SQA_PORT:-8501}:8501"
     volumes:
       - ./data:/srv/data
       - ./runs:/srv/runs
