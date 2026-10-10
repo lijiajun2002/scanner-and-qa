@@ -24,7 +24,7 @@ def _ctx(args) -> ToolContext:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sqa", description="答题键鼠/截图工具（CLI）")
     p.add_argument("--target-url", default=os.environ.get("SQA_TARGET_URL",
-                                                          "http://100.102.134.42:8600"))
+                                                          "http://127.0.0.1:8600"))
     p.add_argument("--token", default=os.environ.get("SQA_TARGET_TOKEN", "admin"))
     p.add_argument("--shot-source", choices=["software", "video"], default="software")
     p.add_argument("--video-source", default=os.environ.get("SQA_VIDEO_SOURCE",

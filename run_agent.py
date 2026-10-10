@@ -3,7 +3,7 @@
 
 用法示例：
   .venv/bin/python run_agent.py \
-      --target-url http://100.102.134.42:8600 --token admin \
+      --target-url http://127.0.0.1:8600 --token admin \
       --shot-source video --video-source v4l2:/dev/video0 --video-size 1920x1080 \
       --run-dir runs/two-sum --max-sessions 6
 
@@ -46,7 +46,7 @@ def _load_llm_settings() -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--target-url", default=os.environ.get("SQA_TARGET_URL",
-                                                           "http://100.102.134.42:8600"))
+                                                           "http://127.0.0.1:8600"))
     ap.add_argument("--token", default=os.environ.get("SQA_TARGET_TOKEN", "admin"))
     ap.add_argument("--shot-source", choices=["software", "video"], default="software")
     ap.add_argument("--video-source", default="v4l2:/dev/video0")
