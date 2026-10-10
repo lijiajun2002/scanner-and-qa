@@ -31,11 +31,19 @@ with st.sidebar:
     max_tokens = st.number_input("max_tokens", 256, 32768, int(settings["max_tokens"]), 256)
 
     st.subheader("🖥️ 截图来源")
-    shot_source = st.selectbox("来源", ["software", "video"],
-                               index=0 if settings["shot_source"] == "software" else 1,
-                               help="software=从 B 端 agent_server 截图；video=本机采集卡(ffmpeg)")
-    video_source = st.text_input("采集来源", value=settings["video_source"])
-    video_size = st.text_input("采集分辨率", value=settings["video_size"])
+    shot_source = st.selectbox(
+        "来源", ["software", "video"],
+        index=0 if settings["shot_source"] == "software" else 1,
+        help="software=从 B 端 agent_server 截图（自动使用 B 的原生分辨率，坐标已归一化，无需设置采集分辨率）；"
+             "video=本机采集卡 ffmpeg 抓帧（需与采集卡/HDMI 实际支持的 mode 一致）")
+    video_source = st.text_input(
+        "采集来源", value=settings["video_source"],
+        help="仅 video 来源使用。Linux: v4l2:/dev/video0；Windows: dshow:video=xxx；或 rtsp://…")
+    video_size = st.text_input(
+        "采集分辨率", value=settings["video_size"],
+        help="仅 video 来源使用。必须与采集卡支持、且 HDMI 实际输出的分辨率一致，"
+             "例如 1920x1080。2K/4K 屏需先把输出设为采集卡支持的 mode，否则会黑屏或偏色。"
+             "software 来源请忽略此项。")
 
     st.subheader("📝 系统提示词")
     system_prompt = st.text_area("agent 的系统提示词", value=settings.get("system_prompt") or SYSTEM_PROMPT,
@@ -58,14 +66,20 @@ tab_clients, tab_monitor, tab_manual = st.tabs(["🧩 客户端", "🤖 任务�
 
 # =========================== 客户端注册 ===========================
 with tab_clients:
-    st.caption("给每台主机 B 注册一个 token。token 由你自定义，注册后写进该机器的 config.json 即可匹配。")
+    st.caption("给每台主机 B 注册一个 token。地址填 B 的 `http://<局域网IP>:8600`（端口即安装时设的 Port）；"
+               "token 由你自定义，写进该机器的 config.json 匹配即可。")
 
     edit_id = st.session_state.get("_edit_client")
     editing = next((c for c in clients if c["id"] == edit_id), None)
     with st.form("client_form"):
         c_name = st.text_input("名称", value=editing["name"] if editing else "")
-        c_url = st.text_input("地址 (agent_server)", value=editing["url"] if editing else "http://192.168.1.50:8600")
-        c_token = st.text_input("token", value=editing["token"] if editing else "admin")
+        c_url = st.text_input(
+            "B 端地址", value=editing["url"] if editing else "http://192.168.1.50:8600",
+            help="填主机 B 的局域网地址 + agent_server 端口，例如 http://<B的IP>:8600；"
+                 "端口即安装 B 端时 setup_server.ps1 里设的 Port（默认 8600）。")
+        c_token = st.text_input(
+            "token", value=editing["token"] if editing else "admin",
+            help="与主机 B 的 config.json 里 token 一致（安装时输入的那个）。")
         submitted = st.form_submit_button("💾 注册 / 更新")
     if submitted:
         if not c_url.strip():
