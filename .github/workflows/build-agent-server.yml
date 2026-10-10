@@ -1,0 +1,53 @@
+name: build-agent-server
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'b_client/agent_server.py'
+      - 'b_client/capture_agent.py'
+      - 'b_client/agent_server.spec'
+      - 'b_client/requirements.txt'
+      - '.github/workflows/build-agent-server.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r b_client/requirements.txt pyinstaller
+
+      - name: Build agent server exe
+        working-directory: b_client
+        run: pyinstaller --noconfirm --clean agent_server.spec
+
+      - name: Stage config template
+        run: Copy-Item b_client/config.example.json b_client/dist/config.json
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SQA-Agent-Server
+          path: |
+            b_client/dist/SQA-Agent-Server.exe
+            b_client/config.example.json
+            b_client/setup_server.ps1
+            b_client/install.cmd
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            b_client/dist/SQA-Agent-Server.exe
+            b_client/setup_server.ps1
+            b_client/config.example.json
+            b_client/install.cmd

@@ -2,10 +2,10 @@
 .venv
 __pycache__
 *.pyc
-.env
-data
-webapp_settings.json
+runs/
+data/
+b_client/
+tests/
 *.jpg
-Dockerfile
-docker-compose.yml
-.dockerignore
+HANDOFF.md
+RUNBOOK.md

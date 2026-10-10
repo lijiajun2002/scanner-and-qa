@@ -1,15 +1,14 @@
 services:
-  scanner-qa:
+  sqa-control:
     build: .
     image: scanner-and-qa:latest
     container_name: scanner-and-qa
-    ports:
-      - "8502:8501"
-      - "8503:8503"
+    # 用 host 网络以便直接访问局域网里的主机 B 和 LLM 端点
+    network_mode: host
     volumes:
-      - ./data:/data
+      - ./data:/srv/data
+      - ./runs:/srv/runs
     environment:
-      # 可选：优先用环境变量注入，避免把 key 写进 data/settings.json
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - B_API_TOKEN=${B_API_TOKEN:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
     restart: unless-stopped
